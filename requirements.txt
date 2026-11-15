@@ -1,0 +1,27 @@
+# AgentCommon backend dependencies.
+# Versions are sane lower bounds; newer versions are compatible.
+
+# Web framework
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+
+# LLM SDK
+anthropic>=0.40.0
+
+# MCP (official Anthropic python SDK; MCPServer since 2.x)
+mcp>=2.3.0
+
+# Database (async SQLAlchemy + SQLite driver + migrations)
+sqlalchemy[asyncio]>=2.0.30
+aiosqlite>=0.20.0
+alembic>=1.13.2
+
+# Validation / configuration
+pydantic>=2.7.4
+pydantic-settings>=2.3.4
+pyyaml>=6.0.1
+
+# Testing
+pytest>=8.2.2
+pytest-asyncio>=0.23.7
+httpx>=0.27.0

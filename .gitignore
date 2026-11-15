@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+
+# Local configuration (secrets only via env vars; template: config.yaml.example)
+config.yaml
+
+# Runtime data (SQLite databases etc.)
+data/
+
+# Logs
+*.log
+logs/

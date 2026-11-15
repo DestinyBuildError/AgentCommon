@@ -1,0 +1,21 @@
+event: text_delta
+data: {"seq":1,"type":"text_delta","data":{"text":"部署属于危险操作"}}
+
+event: text_delta
+data: {"seq":2,"type":"text_delta","data":{"text":"，我需要先向你申"}}
+
+event: text_delta
+data: {"seq":3,"type":"text_delta","data":{"text":"请审批。"}}
+
+event: tool_call_start
+data: {"seq":4,"type":"tool_call_start","data":{"tool_use_id":"tu_be6ee6e0","name":"deploy_tool","input_preview":"{\"env\": \"production\", \"version\": \"v1.2.3\"}"}}
+
+event: approval_request
+data: {"seq":5,"type":"approval_request","data":{"tool_use_id":"tu_be6ee6e0","name":"deploy_tool","input":{"env":"production","version":"v1.2.3"},"reason":"dangerous tool requires user approval"}}
+
+event: tool_call_result
+data: {"seq":6,"type":"tool_call_result","data":{"tool_use_id":"tu_be6ee6e0","is_error":false,"output_preview":"{\"status\": \"deployed\", \"env\": \"production\", \"version\": \"v1.2.3\"}"}}
+
+event: turn_complete
+data: {"seq":7,"type":"turn_complete","data":{"stop_reason":"end_turn","usage":{"input_tokens":270,"output_tokens":50,"cache_read":230,"cache_creation":0},"cost_usd":0.0}}
+

@@ -1,0 +1,36 @@
+event: thinking_delta
+data: {"seq":1,"type":"thinking_delta","data":{"text":"用户在打招呼，介绍 mock 模式可用的演示场景。"}}
+
+event: text_delta
+data: {"seq":2,"type":"text_delta","data":{"text":"你好！我是 mo"}}
+
+event: text_delta
+data: {"seq":3,"type":"text_delta","data":{"text":"ck Agent"}}
+
+event: text_delta
+data: {"seq":4,"type":"text_delta","data":{"text":"。当前运行在**"}}
+
+event: text_delta
+data: {"seq":5,"type":"text_delta","data":{"text":"无 API Ke"}}
+
+event: text_delta
+data: {"seq":6,"type":"text_delta","data":{"text":"y 的脚本模式*"}}
+
+event: text_delta
+data: {"seq":7,"type":"text_delta","data":{"text":"*下，可以试试对"}}
+
+event: text_delta
+data: {"seq":8,"type":"text_delta","data":{"text":"我说「读一下文件"}}
+
+event: text_delta
+data: {"seq":9,"type":"text_delta","data":{"text":"」或「帮我部署」"}}
+
+event: text_delta
+data: {"seq":10,"type":"text_delta","data":{"text":"来演示工具调用与"}}
+
+event: text_delta
+data: {"seq":11,"type":"text_delta","data":{"text":"审批流。"}}
+
+event: turn_complete
+data: {"seq":12,"type":"turn_complete","data":{"stop_reason":"end_turn","usage":{"input_tokens":120,"output_tokens":48,"cache_read":100,"cache_creation":0},"cost_usd":0.0}}
+

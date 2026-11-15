@@ -1,0 +1,46 @@
+# Curated tool catalog - the search space for the discover_tools meta tool.
+#
+# Fields per entry:
+#   name         server name (tools register as mcp__<name>__<tool> after install)
+#   description  one-liner (retrieval target; state clearly "when to use it")
+#   keywords     search keywords, mixed languages welcome
+#   transport    {command, args} -> stdio subprocess  or  {url} -> streamable http
+#                relative paths resolve against this file's directory
+#   trust        builtin (shipped with the repo, audited) | community (third-party)
+#                defaults to community when omitted
+#
+# Three local stdio demo servers are bundled (catalog_servers/) - installable
+# out of the box. Install flow: discover_tools -> install_mcp_server (passes
+# the approval gate) -> call mcp__<name>__<tool> in the same run's next turn.
+
+- name: text_tools
+  description: "Text utilities: reverse a string, convert to upper case, count characters."
+  keywords: [text, string, reverse, uppercase, upper, count, 文本, 字符串, 反转, 大写, 字数]
+  transport:
+    command: python
+    args: [catalog_servers/text_tools_server.py]
+  trust: builtin
+
+- name: unit_convert
+  description: "Unit conversion between Celsius/Fahrenheit temperature and kilometers/miles length."
+  keywords: [unit, convert, conversion, temperature, celsius, fahrenheit, length, km, mile, 单位, 换算, 温度, 摄氏, 华氏, 公里, 英里]
+  transport:
+    command: python
+    args: [catalog_servers/unit_convert_server.py]
+  trust: builtin
+
+- name: password_gen
+  description: "Generate cryptographically secure random passwords with configurable length and symbols."
+  keywords: [password, generator, random, secure, secrets, 密码, 随机, 生成器, 安全]
+  transport:
+    command: python
+    args: [catalog_servers/password_gen_server.py]
+  trust: builtin
+
+# Third-party example template: trust defaults to community
+# - name: web_search
+#   description: "Search the web and return ranked results."
+#   keywords: [search, web, google]
+#   transport:
+#     url: "http://127.0.0.1:9090/mcp"
+#   trust: community

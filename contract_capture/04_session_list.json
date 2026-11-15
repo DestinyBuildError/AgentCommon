@@ -1,0 +1,72 @@
+[
+  {
+    "id": "ce6a3f86-0db4-4a3b-a998-69ae3a4aef9e",
+    "user_id": null,
+    "title": "联调抓包会话",
+    "status": "idle",
+    "model": "claude-opus-4-8",
+    "effort": "high",
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "cache_read_tokens": 0,
+    "total_cost_usd": 0.0,
+    "created_at": "2026-11-08T03:44:20.801985",
+    "updated_at": "2026-11-08T03:44:20.801985"
+  },
+  {
+    "id": "ac281ccd-4725-455f-ad43-913d912c5812",
+    "user_id": null,
+    "title": null,
+    "status": "idle",
+    "model": "claude-opus-4-8",
+    "effort": "high",
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "cache_read_tokens": 0,
+    "total_cost_usd": 0.0,
+    "created_at": "2026-11-08T03:43:12.444999",
+    "updated_at": "2026-11-08T03:43:12.779530"
+  },
+  {
+    "id": "ba5f934f-528d-405f-8c8c-68946b5f45d5",
+    "user_id": null,
+    "title": null,
+    "status": "idle",
+    "model": "claude-opus-4-8",
+    "effort": "high",
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "cache_read_tokens": 0,
+    "total_cost_usd": 0.0,
+    "created_at": "2026-11-08T03:43:12.089469",
+    "updated_at": "2026-11-08T03:43:12.435480"
+  },
+  {
+    "id": "3abf6570-d257-47a4-a96e-f901c7ae521d",
+    "user_id": null,
+    "title": "联调抓包会话",
+    "status": "idle",
+    "model": "claude-opus-4-8",
+    "effort": "high",
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "cache_read_tokens": 0,
+    "total_cost_usd": 0.0,
+    "created_at": "2026-11-08T03:43:12.033441",
+    "updated_at": "2026-11-08T03:43:12.077999"
+  },
+  {
+    "id": "cdec28cd-1300-4e40-8454-110786ee9371",
+    "user_id": null,
+    "title": "联调抓包会话",
+    "status": "idle",
+    "model": "claude-opus-4-8",
+    "effort": "high",
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "cache_read_tokens": 0,
+    "total_cost_usd": 0.0,
+    "created_at": "2026-11-08T03:42:14.982704",
+    "updated_at": "2026-11-08T03:42:15.351971"
+  }
+]

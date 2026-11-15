@@ -1,0 +1,8 @@
+{
+  "status": 200,
+  "body": {
+    "ok": true,
+    "session_id": "adf8b6fa-5cc5-4535-aa12-33d91a11a7ad",
+    "interrupted": false
+  }
+}

@@ -1,0 +1,11 @@
+GET 404 body keys=['error', 'ok'] -> {'ok': False, 'error': {'code': 'not_found', 'message': 'session not found: ghost'}}
+POST /sessions 201 keys=id,user_id,title,status,model,effort,total_input_tokens,total_output_tokens,cache_read_tokens,total_cost_usd,created_at,updated_at
+POST /messages 202 body={'ok': True, 'session_id': 'ce6a3f86-0db4-4a3b-a998-69ae3a4aef9e', 'queued': True}
+SSE chat frame kinds=['thinking_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'turn_complete']
+SSE file frame kinds=['text_delta', 'text_delta', 'text_delta', 'text_delta', 'tool_call_start', 'tool_call_result', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'text_delta', 'turn_complete']
+SSE approval-allow kinds=['text_delta', 'text_delta', 'text_delta', 'tool_call_start', 'approval_request', 'tool_call_result', 'turn_complete']
+SSE approval-deny kinds=['text_delta', 'text_delta', 'text_delta', 'tool_call_start', 'approval_request', 'tool_call_result', 'turn_complete']
+GET messages seqs=[1, 2, 3, 4]
+SSE after_seq=20 replayed kinds=['turn_complete']
+POST /interrupt 200 body={'ok': True, 'session_id': 'adf8b6fa-5cc5-4535-aa12-33d91a11a7ad', 'interrupted': False}
+DELETE /sessions -> 204

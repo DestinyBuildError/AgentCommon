@@ -1,0 +1,3 @@
+notes.txt — mock 工作区示例文件
+由 backend/dev_mock_server.py 启动时创建。
+用于演示 read_file 工具链路与前端 ToolCard 渲染。

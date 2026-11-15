@@ -1,0 +1,14 @@
+{
+  "id": "94dd4405-9fd6-47b4-b6d8-7831281e6277",
+  "user_id": null,
+  "title": null,
+  "status": "idle",
+  "model": "claude-opus-4-8",
+  "effort": "high",
+  "total_input_tokens": 350,
+  "total_output_tokens": 76,
+  "cache_read_tokens": 300,
+  "total_cost_usd": 0.0,
+  "created_at": "2026-11-08T03:44:20.975432",
+  "updated_at": "2026-11-08T03:44:21.371855"
+}

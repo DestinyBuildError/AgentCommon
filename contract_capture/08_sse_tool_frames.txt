@@ -1,0 +1,63 @@
+event: text_delta
+data: {"seq":1,"type":"text_delta","data":{"text":"好的，我先读取工"}}
+
+event: text_delta
+data: {"seq":2,"type":"text_delta","data":{"text":"作区里的 not"}}
+
+event: text_delta
+data: {"seq":3,"type":"text_delta","data":{"text":"es.txt 看"}}
+
+event: text_delta
+data: {"seq":4,"type":"text_delta","data":{"text":"看内容。"}}
+
+event: tool_call_start
+data: {"seq":5,"type":"tool_call_start","data":{"tool_use_id":"tu_e8817f0d","name":"read_file","input_preview":"{\"path\": \"notes.txt\"}"}}
+
+event: tool_call_result
+data: {"seq":6,"type":"tool_call_result","data":{"tool_use_id":"tu_e8817f0d","is_error":false,"output_preview":"{\"path\": \"notes.txt\", \"content\": \"notes.txt — mock 工作区示例文件\\r\\n由 backend/dev_mock_server.py 启动时创建。\\r\\n用于演示 read_file 工具链路与前端 ToolCard 渲染。\\r\\n\", \"bytes\": 158, \"truncated\": false}"}}
+
+event: text_delta
+data: {"seq":7,"type":"text_delta","data":{"text":"已经读完 not"}}
+
+event: text_delta
+data: {"seq":8,"type":"text_delta","data":{"text":"es.txt：这"}}
+
+event: text_delta
+data: {"seq":9,"type":"text_delta","data":{"text":"是 mock 工"}}
+
+event: text_delta
+data: {"seq":10,"type":"text_delta","data":{"text":"作区的示例文件，"}}
+
+event: text_delta
+data: {"seq":11,"type":"text_delta","data":{"text":"内容由 dev_"}}
+
+event: text_delta
+data: {"seq":12,"type":"text_delta","data":{"text":"mock_ser"}}
+
+event: text_delta
+data: {"seq":13,"type":"text_delta","data":{"text":"ver 在启动时"}}
+
+event: text_delta
+data: {"seq":14,"type":"text_delta","data":{"text":"写入。工具链路（"}}
+
+event: text_delta
+data: {"seq":15,"type":"text_delta","data":{"text":"tool_cal"}}
+
+event: text_delta
+data: {"seq":16,"type":"text_delta","data":{"text":"l_start "}}
+
+event: text_delta
+data: {"seq":17,"type":"text_delta","data":{"text":"→ tool_c"}}
+
+event: text_delta
+data: {"seq":18,"type":"text_delta","data":{"text":"all_resu"}}
+
+event: text_delta
+data: {"seq":19,"type":"text_delta","data":{"text":"lt → 回答）"}}
+
+event: text_delta
+data: {"seq":20,"type":"text_delta","data":{"text":"走通了。"}}
+
+event: turn_complete
+data: {"seq":21,"type":"turn_complete","data":{"stop_reason":"end_turn","usage":{"input_tokens":350,"output_tokens":76,"cache_read":300,"cache_creation":0},"cost_usd":0.0}}
+
