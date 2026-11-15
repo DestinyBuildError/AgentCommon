@@ -1,3 +1,6 @@
+""" 契约抓包脚本：对运行中的 mock 服务器（127.0.0.1:8000）发起真实 HTTP，
+抓取全部 9 端点的真实 JSON 载荷与 SSE 原始 wire 帧，存到
+`contract_capture/` 供前端对照与 vitest fixtures 使用。"""
 
 from __future__ import annotations
 
@@ -31,6 +34,7 @@ def frame_data(block: str) -> dict:
 
 
 class SSECollector:
+    """共享列表的 SSE 流收集器：边收边可读，turn_complete 后自动断开。"""
 
     def __init__(self, client: httpx.AsyncClient, url: str, max_frames: int = 500):
         self.frames: list[str] = []
@@ -84,6 +88,7 @@ async def run_turn(
     decision: str | None = None,
     scenario_label: str = "",
 ) -> list[str]:
+    """发一条消息并完整收集一轮事件；decision 非 None 时等待审批帧并决议。"""
     collector = SSECollector(client, f"/api/sessions/{sid}/events?after_seq=0")
     collector.start()
     await asyncio.sleep(0.3)
@@ -111,12 +116,14 @@ async def run_turn(
 async def main() -> int:
     findings: list[str] = []
     async with httpx.AsyncClient(base_url=BASE, timeout=15.0) as client:
+        # 0. health + 统一错误格式
         r = await client.get("/health")
         save("01_health.json", r.json())
         r = await client.get("/api/sessions/ghost")
         findings.append(f"GET 404 body keys={sorted(r.json())} -> {r.json()}")
         save("02_error_shape_404.json", r.json())
 
+        # 1. POST /sessions
         r = await client.post("/api/sessions", json={"title": "联调抓包会话"})
         assert r.status_code == 201, r.text
         session = r.json()
@@ -124,9 +131,11 @@ async def main() -> int:
         save("03_session_create.json", session)
         findings.append("POST /sessions 201 keys=" + ",".join(session))
 
+        # 2. GET /sessions, GET /sessions/{id}
         save("04_session_list.json", (await client.get("/api/sessions")).json())
         save("05_session_detail.json", (await client.get(f"/api/sessions/{sid}")).json())
 
+        # 3. chat 场景（默认）：thinking + text deltas + turn_complete
         print("== chat scenario ==")
         ack = await client.post(f"/api/sessions/{sid}/messages", json={"text": "你好"})
         assert ack.status_code == 202
@@ -138,11 +147,13 @@ async def main() -> int:
         save("07_sse_chat_frames.txt", "\n\n".join(frames) + "\n\n")
         findings.append(f"SSE chat frame kinds={[frame_kind(f) for f in frames]}")
 
+        # 4. file 场景：read_file 工具链路
         print("== file scenario ==")
         sid2 = (await client.post("/api/sessions", json={})).json()["id"]
         frames2 = await run_turn(client, sid2, "读一下文件", scenario_label="08_sse_tool_frames.txt")
         findings.append(f"SSE file frame kinds={[frame_kind(f) for f in frames2]}")
 
+        # 5. 审批 allow 场景
         print("== approval allow scenario ==")
         sid3 = (await client.post("/api/sessions", json={})).json()["id"]
         frames3 = await run_turn(
@@ -150,6 +161,7 @@ async def main() -> int:
         )
         findings.append(f"SSE approval-allow kinds={[frame_kind(f) for f in frames3]}")
 
+        # 6. 审批 deny 场景
         print("== approval deny scenario ==")
         sid4 = (await client.post("/api/sessions", json={})).json()["id"]
         frames4 = await run_turn(
@@ -157,17 +169,20 @@ async def main() -> int:
         )
         findings.append(f"SSE approval-deny kinds={[frame_kind(f) for f in frames4]}")
 
+        # 7. 消息历史（全量 + 增量）+ 会话详情（用量累计后）
         all_msgs = (await client.get(f"/api/sessions/{sid2}/messages")).json()
         save("13_messages_all.json", all_msgs)
         save("14_messages_after_seq.json", (await client.get(f"/api/sessions/{sid2}/messages?after_seq=2")).json())
         save("15_session_detail_after_usage.json", (await client.get(f"/api/sessions/{sid2}")).json())
         findings.append(f"GET messages seqs={[m['seq'] for m in all_msgs]}")
 
-        last = frame_data(frames2[-2])["seq"]
+        # 8. after_seq 增量 SSE（断线重连续传语义）：after_seq=首帧 seq → 只回缺口
+        last = frame_data(frames2[-2])["seq"]  # turn_complete 前一帧
         inc = await read_incremental(client, sid2, after_seq=last)
         findings.append(f"SSE after_seq={last} replayed kinds={[frame_kind(f) for f in inc]}")
         save("16_sse_incremental_replay.txt", "\n\n".join(inc) + "\n\n")
 
+        # 9. interrupt + delete
         r = await client.post(f"/api/sessions/{sid4}/interrupt")
         findings.append(f"POST /interrupt {r.status_code} body={r.json()}")
         save("17_interrupt_ack.json", {"status": r.status_code, "body": r.json()})
@@ -182,6 +197,7 @@ async def main() -> int:
 async def read_incremental(client: httpx.AsyncClient, sid: str, after_seq: int) -> list[str]:
     collector = SSECollector(client, f"/api/sessions/{sid}/events?after_seq={after_seq}")
     collector.start()
+    # 增量订阅若没有新事件会一直挂着 → 超时后按已收帧返回
     try:
         return await asyncio.wait_for(collector.task, timeout=2.0)
     except (asyncio.TimeoutError, TimeoutError):

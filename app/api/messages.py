@@ -1,3 +1,4 @@
+"""消息路由（契约）：发消息（202 异步处理）、增量拉历史。"""
 
 from __future__ import annotations
 
@@ -20,6 +21,7 @@ async def post_message(
     db: AsyncSession = Depends(get_db),
     manager: SessionManager = Depends(get_session_manager),
 ) -> dict:
+    """发用户消息 → 202（异步处理：入队后由会话消费者按序执行）。"""
     repo = Repository(db)
     session = await repo.get_session(session_id)
     if session is None:
@@ -34,6 +36,7 @@ async def get_messages(
     after_seq: int = 0,
     db: AsyncSession = Depends(get_db),
 ) -> list[MessageOut]:
+    """增量拉历史：after_seq 游标（与 SSE 续传语义对齐）。"""
     repo = Repository(db)
     session = await repo.get_session(session_id)
     if session is None:

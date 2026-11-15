@@ -1,3 +1,11 @@
+""" （协议级，对真实 mock 服务器执行）。
+
+用法：
+    python tools_regression.py full # 全链路 + 断线重连 + 刷新恢复 + 抽屉操作
+    python tools_regression.py after-restart <old_last_seq> # 重启后重同步信号验证
+
+每项输出 PASS/FAIL，退出码非 0 表示有 FAIL。
+"""
 
 from __future__ import annotations
 
@@ -9,7 +17,7 @@ import httpx
 
 BASE = "http://127.0.0.1:8000"
 
-results: list[tuple[str, str, str]] = []
+results: list[tuple[str, str, str]] = []  # (item, PASS/FAIL, detail)
 
 
 def report(item: str, ok: bool, detail: str = "") -> None:
@@ -27,6 +35,7 @@ def frame_data(block: str) -> dict:
 
 
 class SSECollector:
+    """可控断开的 SSE 收集器（模拟真实前端 fetch 流）。"""
 
     def __init__(self, client: httpx.AsyncClient, url: str):
         self.frames: list[str] = []
@@ -51,6 +60,7 @@ class SSECollector:
         return self.frames
 
     def kill(self) -> None:
+        """硬断 SSE 连接（模拟网络断开/杀连接）。"""
         if self.task and not self.task.done():
             self.task.cancel()
 
@@ -67,6 +77,7 @@ def seqs_of(frames: list[str]) -> list[int]:
 
 
 async def full(client: httpx.AsyncClient) -> int:
+    # ---- ① 发消息 → 流式渲染 → 收尾 全链路 ----
     sid = (await client.post("/api/sessions", json={"title": "回归-全链路"})).json()["id"]
     collector = SSECollector(client, f"/api/sessions/{sid}/events?after_seq=0")
     collector.start()
@@ -86,6 +97,9 @@ async def full(client: httpx.AsyncClient) -> int:
     tc = frame_data(frames[-1])
 
     def mock_cost_usd(u: dict) -> float:
+        """ 后 turn_complete.cost_usd 是定价表真实计算值（claude-opus-4-8：
+        输入 $5 / 输出 $25 per MTok，cache 读 0.1x、写 1.25x）。mock 服务器
+        用真实引擎发 turn_complete，故这里按同口径复算并对账。"""
         rate = {"in": 5.0, "out": 25.0, "cr": 0.5, "cw": 6.25}
         return round(
             (
@@ -99,7 +113,7 @@ async def full(client: httpx.AsyncClient) -> int:
 
     expected_cost = mock_cost_usd(tc["data"]["usage"])
     report(
-        "①b turn_complete 载荷字段（P4-C：cost_usd 定价表真实值）",
+        "①b turn_complete 载荷字段（cost_usd 定价表真实值）",
         tc["data"]["usage"].keys() >= {"input_tokens", "output_tokens", "cache_read"}
         and expected_cost > 0
         and abs(tc["data"]["cost_usd"] - expected_cost) < 1e-9,
@@ -107,15 +121,17 @@ async def full(client: httpx.AsyncClient) -> int:
         f"expected={expected_cost}",
     )
 
+    # ---- ② 杀 SSE 连接 → after_seq 续传不丢不重 ----
     sid2 = (await client.post("/api/sessions", json={})).json()["id"]
     c2 = SSECollector(client, f"/api/sessions/{sid2}/events?after_seq=0")
     c2.start()
     await asyncio.sleep(0.3)
     await client.post(f"/api/sessions/{sid2}/messages", json={"text": "slow 慢速输出"})
-    await asyncio.sleep(1.2)
+    await asyncio.sleep(1.2)  # slow 场景 delta 间隔 0.25s → 收到部分帧
     killed_at = c2.last_seq
-    c2.kill()
+    c2.kill()  # 硬断连接（此时 turn 尚未完成）
     await asyncio.sleep(0.3)
+    # 前端语义：指数退避后带 after_seq=lastSeq 重连
     c2b = SSECollector(client, f"/api/sessions/{sid2}/events?after_seq={killed_at}")
     c2b.start()
     rest = await c2b.wait_done()
@@ -134,6 +150,7 @@ async def full(client: httpx.AsyncClient) -> int:
         f"续传{len(rest)}帧到turn_complete 无重复",
     )
 
+    # ---- ③ 刷新页面 → 历史恢复（messages 全量 + 事件全量重放双通道）----
     msgs = (await client.get(f"/api/sessions/{sid2}/messages")).json()
     replay_collector = SSECollector(client, f"/api/sessions/{sid2}/events?after_seq=0")
     replay_collector.start()
@@ -144,10 +161,10 @@ async def full(client: httpx.AsyncClient) -> int:
         len(msgs) >= 2
         and msgs[0]["role"] == "user"
         and msgs[-1]["role"] == "assistant"
-        and msgs[-1]["content"][0]["text"].startswith("这")
+        and msgs[-1]["content"][0]["text"].startswith("这")  # slow 场景正文完整落库
         and replay_seqs == list(range(1, len(replay_seqs) + 1))
         and replay[-1].startswith("event: turn_complete")
-        and max(msg_seqs) < max(replay_seqs)
+        and max(msg_seqs) < max(replay_seqs)  # 两个独立 seq 空间（前端不得混用）
     )
     report(
         "③ 刷新页面历史恢复",
@@ -156,9 +173,11 @@ async def full(client: httpx.AsyncClient) -> int:
         f"(独立空间: max(msg)={max(msg_seqs)} < max(evt)={max(replay_seqs)})",
     )
 
+    # ---- ④ 会话抽屉：列表 / 新建 / 切换 / 删除 ----
     before = (await client.get("/api/sessions")).json()
     created = (await client.post("/api/sessions", json={"title": "回归-抽屉"})).json()
     after = (await client.get("/api/sessions")).json()
+    # 切换到旧会话再回来：旧会话事件重放可用（切换 = openSession + 全量重放）
     switch_back = SSECollector(client, f"/api/sessions/{sid}/events?after_seq=0")
     switch_back.start()
     switch_frames = await switch_back.wait_done()
@@ -167,7 +186,7 @@ async def full(client: httpx.AsyncClient) -> int:
     final = (await client.get("/api/sessions")).json()
     ok = (
         len(after) == len(before) + 1
-        and len(switch_frames) == len(frames)
+        and len(switch_frames) == len(frames)  # 切回旧会话重放出同样多的事件
         and deleted.status_code == 204
         and gone.status_code == 404
         and len(final) == len(before)
@@ -179,12 +198,17 @@ async def full(client: httpx.AsyncClient) -> int:
         f"删除→204→详情404；终态列表 {len(final)}",
     )
 
+    # 返回游标供 after-restart 阶段用
     print(f"\nRESTART_CURSOR={c2.last_seq}")
     print(f"RESTART_SESSION={sid2}")
     return 0
 
 
 async def after_restart(client: httpx.AsyncClient, sid: str, old_cursor: int) -> int:
+    """服务重启后：旧游标超出新进程 seq 空间 → 服务端全量重同步重放（seq 从 1 起）。
+
+    这就是前端「seq ≤ 连接基线 → 整体替换本地状态」信号的来源。
+    """
     c = SSECollector(client, f"/api/sessions/{sid}/events?after_seq={old_cursor}")
     c.start()
     frames = await c.wait_done()

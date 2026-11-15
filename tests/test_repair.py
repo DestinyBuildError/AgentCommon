@@ -1,3 +1,8 @@
+"""repair_orphans 单元测试（不变量 1：无孤儿 tool_use）。
+
+覆盖：孤儿检测、修复后无孤儿（幂等）、多孤儿、混合正常消息不受影响、
+入参不被修改。
+"""
 
 from __future__ import annotations
 
@@ -35,6 +40,9 @@ def assistant_with(*tool_use_ids: str, text: str = "") -> dict:
     return {"role": "assistant", "content": content}
 
 
+# ----------------------------------------------------------------------
+
+
 def test_detects_orphan_tool_use() -> None:
     messages = [user_text("hi"), assistant_with("tu_1")]
     assert needs_repair(messages) is True
@@ -51,8 +59,9 @@ def test_repair_makes_list_orphan_free_and_is_idempotent() -> None:
     messages = [user_text("hi"), assistant_with("tu_1", text="working")]
     repaired = repair_orphans(messages)
 
-    assert needs_repair(repaired) is False
+    assert needs_repair(repaired) is False  # 修复后无孤儿
 
+    # 合成结果紧跟在孤儿 assistant 消息之后
     assert len(repaired) == 3
     assert repaired[2]["role"] == "user"
     block = repaired[2]["content"][0]
@@ -61,6 +70,7 @@ def test_repair_makes_list_orphan_free_and_is_idempotent() -> None:
     assert block["content"] == SYNTHETIC_INTERRUPTED
     assert block["is_error"] is True
 
+    # 幂等：再修一遍是 no-op
     assert repair_orphans(repaired) == repaired
 
 
@@ -82,6 +92,7 @@ def test_orphans_across_multiple_assistant_messages() -> None:
         assistant_with("tu_2"),
     ]
     repaired = repair_orphans(messages)
+    # 每个孤儿 assistant 后各插一条合成消息
     assert [m["role"] for m in repaired] == ["assistant", "user", "assistant", "user"]
     assert repaired[1]["content"][0]["tool_use_id"] == "tu_1"
     assert repaired[3]["content"][0]["tool_use_id"] == "tu_2"
@@ -89,18 +100,21 @@ def test_orphans_across_multiple_assistant_messages() -> None:
 
 
 def test_mixed_normal_messages_untouched() -> None:
+    """孤儿与正常配对混排：只补孤儿，正常消息原样保留。"""
     messages = [
         user_text("q1"),
         assistant_with("tu_ok", text="checking"),
         user_results("tu_ok"),
         assistant_with("tu_lost", text="hmm"),
-        user_text("q2"),
+        user_text("q2"),  # 普通文本消息，不含 tool_result
     ]
     repaired = repair_orphans(messages)
 
     assert needs_repair(repaired) is False
     assert len(repaired) == 6
+    # tu_ok 的配对结果仍在原位（下标 2）
     assert repaired[2] == user_results("tu_ok")
+    # 合成结果插在孤儿 assistant（原下标 3）之后，普通 user q2 顺延到末尾
     assert repaired[4]["content"][0]["tool_use_id"] == "tu_lost"
     assert repaired[5] == user_text("q2")
 
@@ -109,11 +123,12 @@ def test_repair_does_not_mutate_input() -> None:
     messages = [assistant_with("tu_1")]
     snapshot = copy.deepcopy(messages)
     repaired = repair_orphans(messages)
-    assert messages == snapshot
+    assert messages == snapshot  # 纯函数：入参原样
     assert repaired is not messages
 
 
 def test_partial_pairing_only_repairs_missing_ones() -> None:
+    """assistant 发了两个 tool_use，user 只回了一个 → 只补缺的那个。"""
     messages = [
         assistant_with("tu_1", "tu_2"),
         user_results("tu_1"),
@@ -121,12 +136,14 @@ def test_partial_pairing_only_repairs_missing_ones() -> None:
     assert find_orphans(messages) == [(0, "tu_2")]
     repaired = repair_orphans(messages)
     assert needs_repair(repaired) is False
+    # 合成结果紧跟孤儿 assistant，现有结果消息原样顺延
     assert repaired[1]["content"][0]["tool_use_id"] == "tu_2"
     assert repaired[1]["content"][0]["is_error"] is True
     assert repaired[2] == user_results("tu_1")
 
 
 def test_content_string_messages_are_skipped() -> None:
+    """content 为纯字符串的消息不可能含 tool_use，扫描时安全跳过。"""
     messages = [
         {"role": "user", "content": "plain text"},
         {"role": "assistant", "content": "plain reply"},

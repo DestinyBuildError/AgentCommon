@@ -1,3 +1,10 @@
+"""MCPManager 单元测试—— 连接层全部 fake，绝不依赖真实第三方 server。
+
+覆盖：正常注册带前缀（mcp__<server>__<tool>）、启动失败降级不阻塞、
+运行中断连 → unavailable → is_error("MCP server X unreachable, try
+local tools")、惰性重连一次恢复、tools/call isError 透传、以及
+demo_mcp_server.py 真实 stdio 子进程的端到端冒烟（mcp SDK 可用时）。
+"""
 
 from __future__ import annotations
 
@@ -24,6 +31,7 @@ BACKEND_ROOT = Path(__file__).resolve().parent.parent
 
 
 def test_python_alias_resolves_to_backend_interpreter() -> None:
+    """裸 python 别名 → 当前解释器（venv，必有 mcp）；显式路径原样保留。"""
     assert _resolve_python_alias("python") == sys.executable
     assert _resolve_python_alias("Python3.EXE") == sys.executable
     assert _resolve_python_alias("python3") == sys.executable
@@ -31,6 +39,11 @@ def test_python_alias_resolves_to_backend_interpreter() -> None:
         BACKEND_ROOT / ".venv" / "Scripts" / "python.exe"
     )
     assert _resolve_python_alias(None) is None
+
+
+# ----------------------------------------------------------------------
+# Fakes：session-like 对象（initialize/list_tools/call_tool）
+# ----------------------------------------------------------------------
 
 
 class FakeTool:
@@ -57,6 +70,7 @@ class FakeCallToolResult:
 
 
 class FakeSession:
+    """可脚本化的 session：断连（call_tool 抛异常）、挂起（超时路径）均可。"""
 
     def __init__(
         self,
@@ -92,6 +106,7 @@ class FakeSession:
 
 
 def make_connector(sessions: list[FakeSession]):
+    """构造注入式 connector：按序 yield 预设 session（连接即消费一个）。"""
     issued: list[FakeSession] = []
 
     def connector(config: Any):
@@ -105,7 +120,7 @@ def make_connector(sessions: list[FakeSession]):
 
         return cm
 
-    connector.issued = issued
+    connector.issued = issued  # type: ignore[attr-defined]
     return connector
 
 
@@ -117,12 +132,17 @@ def demo_config(name: str = "demo") -> MCPServerConfig:
     return MCPServerConfig(name=name, command="python", args=["x.py"])
 
 
+# ----------------------------------------------------------------------
+# parse_mcp_servers
+# ----------------------------------------------------------------------
+
+
 def test_parse_mcp_servers_normal_and_invalid() -> None:
     configs = parse_mcp_servers(
         [
             {"name": "demo", "command": "python", "args": ["a.py"]},
             {"name": "http-one", "url": "http://127.0.0.1:8080/mcp"},
-            {"name": "bad", "args": ["no-command-or-url"]},
+            {"name": "bad", "args": ["no-command-or-url"]},  # 缺 command/url
             "not-a-dict",
             {"name": "off", "command": "python", "enabled": False},
         ]
@@ -134,6 +154,11 @@ def test_parse_mcp_servers_normal_and_invalid() -> None:
     assert parse_mcp_servers([]) == []
 
 
+# ----------------------------------------------------------------------
+# 正常注册：命名空间前缀
+# ----------------------------------------------------------------------
+
+
 async def test_start_registers_tools_with_namespace_prefix() -> None:
     session = FakeSession([FakeTool("current_time", "Return time"), FakeTool("echo_text")])
     registry = make_registry()
@@ -142,20 +167,24 @@ async def test_start_registers_tools_with_namespace_prefix() -> None:
     )
     connected = await manager.start()
     assert connected == ["demo"]
+    # 前缀命名空间进同一 registry
     assert "mcp__demo__current_time" in registry.names()
     assert "mcp__demo__echo_text" in registry.names()
     spec = registry.get("mcp__demo__current_time")
     assert spec is not None
     assert spec.description == "Return time"
     assert spec.metadata["mcp_server"] == "demo"
+    # api schema 形态正确（模型视角只有一套工具）
     schema = spec.api_schema()
     assert schema["name"] == "mcp__demo__current_time"
     assert schema["input_schema"] == {"type": "object", "properties": {}}
+    # handler 经 manager.call 走 tools/call
     assert await spec.handler({"text": "hi"}) == "echo:hi"
     await manager.stop()
 
 
 async def test_tool_call_timeout_maps_to_mcp_unreachable() -> None:
+    """tools/call 挂起 → 超时 → 标记 unavailable + mcp_unreachable。"""
     session = FakeSession([FakeTool("slow")], hang_calls=True)
     registry = make_registry()
     manager = MCPManager(
@@ -173,7 +202,13 @@ async def test_tool_call_timeout_maps_to_mcp_unreachable() -> None:
     await manager.stop()
 
 
+# ----------------------------------------------------------------------
+# 启动失败：降级不阻塞（第一行）
+# ----------------------------------------------------------------------
+
+
 async def test_startup_failure_degrades_without_blocking() -> None:
+    """坏 server（连接即炸）被跳过 + warning，其余 server 正常注册。"""
 
     def connector(config: Any):
         @asynccontextmanager
@@ -202,6 +237,7 @@ async def test_startup_failure_degrades_without_blocking() -> None:
 
 
 async def test_startup_timeout_degrades() -> None:
+    """initialize 挂起 → 连接超时 → 该 server 跳过。"""
 
     def connector(config: Any):
         @asynccontextmanager
@@ -211,7 +247,7 @@ async def test_startup_timeout_degrades() -> None:
             async def hang() -> None:
                 await asyncio.sleep(3600)
 
-            session.initialize = hang
+            session.initialize = hang  # type: ignore[method-assign]
             yield session
 
         return cm
@@ -230,12 +266,14 @@ async def test_startup_timeout_degrades() -> None:
 
 
 async def test_duplicate_tool_name_skipped_not_fatal() -> None:
+    """两个 server 提供同名工具 → 前缀不同不冲突；同 server 重复注册被跳过。"""
     session = FakeSession([FakeTool("t1")])
     registry = make_registry()
     manager = MCPManager(
         [demo_config()], registry, connect_timeout_s=1, connector=make_connector([session])
     )
     await manager.start()
+    # 手动再注册同名 → 冲突被跳过（不抛 ValueError）
     count_before = len(registry)
     registered = manager._register_tools(
         manager._states["demo"], [FakeTool("t1")]
@@ -243,6 +281,11 @@ async def test_duplicate_tool_name_skipped_not_fatal() -> None:
     assert registered == 0
     assert len(registry) == count_before
     await manager.stop()
+
+
+# ----------------------------------------------------------------------
+# 运行中断连：unavailable → is_error → 惰性重连（第二行）
+# ----------------------------------------------------------------------
 
 
 async def test_runtime_disconnect_marks_unavailable_and_returns_is_error() -> None:
@@ -257,6 +300,7 @@ async def test_runtime_disconnect_marks_unavailable_and_returns_is_error() -> No
     )
     await manager.start()
 
+    # 经 dispatcher 全链路：handler 抛 mcp_unreachable → 归一化 is_error
     dispatcher = ToolDispatcher(registry)
     result = await dispatcher.dispatch("mcp__demo__echo_text", {"text": "hi"}, "tu_1")
     assert result.is_error is True
@@ -278,19 +322,21 @@ async def test_lazy_reconnect_recovers_on_next_call() -> None:
     await manager.start()
     spec = registry.get("mcp__demo__echo_text")
 
+    # 第一次调用：断连 → unavailable
     with pytest.raises(ToolPermanentError) as exc_info:
         await spec.handler({"text": "a"})
     assert exc_info.value.code == "mcp_unreachable"
 
+    # 下次调用前惰性重连一次 → 换新 session → 成功
     assert await spec.handler({"text": "b"}) == "echo:b"
-    assert connector.issued == [first, second]
+    assert connector.issued == [first, second]  # 重连恰好发生一次
     assert manager._states["demo"].available is True
     await manager.stop()
 
 
 async def test_reconnect_failure_still_reports_unreachable() -> None:
     first = FakeSession([FakeTool("t")], fail_calls=True)
-    connector = make_connector([first])
+    connector = make_connector([first])  # 无后续 session → 重连必失败
     registry = make_registry()
     manager = MCPManager(
         [demo_config()], registry, connect_timeout_s=0.5, connector=connector
@@ -307,6 +353,7 @@ async def test_reconnect_failure_still_reports_unreachable() -> None:
 
 
 async def test_remote_tool_iserror_raises_tool_error() -> None:
+    """server 返回 isError → mcp_tool_error（内容透传给模型自纠）。"""
     session = FakeSession([FakeTool("boom_tool")])
     registry = make_registry()
     manager = MCPManager(
@@ -318,7 +365,7 @@ async def test_remote_tool_iserror_raises_tool_error() -> None:
     assert result.is_error is True
     assert result.code == "mcp_tool_error"
     assert "remote validation failed" in result.content
-    assert manager._states["demo"].available is True
+    assert manager._states["demo"].available is True  # isError 不算断连
     await manager.stop()
 
 
@@ -330,7 +377,14 @@ async def test_call_to_unknown_server_returns_unreachable() -> None:
     assert exc_info.value.code == "mcp_unreachable"
 
 
+# ----------------------------------------------------------------------
+# demo_mcp_server.py 真实 stdio 子进程端到端（mcp SDK 可用时跑）
+# ----------------------------------------------------------------------
+
+
 def test_real_demo_server_stdio_roundtrip():
+    """真实拉起 demo_mcp_server.py：注册带前缀 + echo 全链路（启动失败降级的
+    反面验证）。子进程 spawn 慢平台可能超时——视为环境问题跳过，不算失败。"""
     pytest.importorskip("mcp")
     registry = make_registry()
     config = MCPServerConfig(

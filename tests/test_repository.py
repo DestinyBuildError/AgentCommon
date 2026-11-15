@@ -1,3 +1,12 @@
+"""Repository 单元测试：aiosqlite 内存库（StaticPool 单连接共享）。
+
+覆盖任务要求：
+1. CRUD 正确性（创建/读取/列表/删除级联/状态更新）
+2. seq 会话内单调递增
+3. 向已占用的 (session_id, seq) 插入触发 IntegrityError
+4. update_session_usage 增量累加正确
+5. record_tool_call 后可查询（含 tool_name 过滤）
+"""
 
 from __future__ import annotations
 
@@ -15,6 +24,7 @@ from app.db.repository import Repository
 
 @pytest.fixture
 async def db_session() -> AsyncIterator[AsyncSession]:
+    """每个测试一个独立的内存库：先建表，测完释放引擎。"""
     engine = build_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
@@ -29,11 +39,16 @@ async def repo(db_session: AsyncSession) -> Repository:
     return Repository(db_session)
 
 
+# ----------------------------------------------------------------------
+# sessions：CRUD
+# ----------------------------------------------------------------------
+
+
 async def test_create_and_get_session(repo: Repository) -> None:
     created = await repo.create_session(
         model="claude-opus-4-8", effort="high", title="demo", user_id="u1"
     )
-    assert created.id and len(created.id) == 36
+    assert created.id and len(created.id) == 36  # str(uuid4)
     assert created.status == "idle"
     assert created.total_input_tokens == 0
     assert created.total_output_tokens == 0
@@ -63,11 +78,13 @@ async def test_list_sessions_order_and_pagination(repo: Repository) -> None:
 
     sessions = await repo.list_sessions()
     assert {s.id for s in sessions} == {s1.id, s2.id}
+    # 最近活跃在前
     assert sessions[0].updated_at >= sessions[-1].updated_at
 
     page = await repo.list_sessions(limit=1)
     assert len(page) == 1
 
+    # 更新 s1 后它应排到最前
     await repo.update_session_status(s1.id, "running")
     sessions = await repo.list_sessions()
     assert sessions[0].id == s1.id
@@ -105,6 +122,7 @@ async def test_delete_session_cascades(repo: Repository, db_session: AsyncSessio
     assert orphan_msgs == []
     assert orphan_calls == []
 
+    # 重复删除返回 False
     assert await repo.delete_session(s.id) is False
 
 
@@ -117,6 +135,11 @@ async def test_update_session_status(repo: Repository) -> None:
     assert await repo.update_session_status("nonexistent", "idle") is None
 
 
+# ----------------------------------------------------------------------
+# messages：seq 单调 + 增量游标
+# ----------------------------------------------------------------------
+
+
 async def test_append_message_seq_monotonic_within_session(repo: Repository) -> None:
     s = await repo.create_session(model="m", effort="high")
     seqs = []
@@ -124,7 +147,7 @@ async def test_append_message_seq_monotonic_within_session(repo: Repository) -> 
         role = "user" if i % 2 == 0 else "assistant"
         msg = await repo.append_message(s.id, role, [{"type": "text", "text": f"m{i}"}])
         seqs.append(msg.seq)
-    assert seqs == [1, 2, 3, 4, 5]
+    assert seqs == [1, 2, 3, 4, 5]  # 会话内从 1 开始单调递增
 
 
 async def test_seq_counter_is_per_session(repo: Repository) -> None:
@@ -133,7 +156,7 @@ async def test_seq_counter_is_per_session(repo: Repository) -> None:
     await repo.append_message(s1.id, "user", [{"type": "text", "text": "a"}])
     await repo.append_message(s1.id, "assistant", [{"type": "text", "text": "b"}])
     msg = await repo.append_message(s2.id, "user", [{"type": "text", "text": "c"}])
-    assert msg.seq == 1
+    assert msg.seq == 1  # 不受其他会话影响
 
 
 async def test_duplicate_session_seq_raises_integrity_error(
@@ -143,6 +166,7 @@ async def test_duplicate_session_seq_raises_integrity_error(
     first = await repo.append_message(s.id, "user", [{"type": "text", "text": "a"}])
     assert first.seq == 1
 
+    # 向已占用的 (session_id, seq) 直接插入 → UNIQUE 约束触发 IntegrityError
     duplicate = Message(
         id="dup-0000-0000-0000-000000000001",
         session_id=s.id,
@@ -165,7 +189,7 @@ async def test_get_messages_after_seq_cursor(repo: Repository) -> None:
     assert [m.seq for m in all_msgs] == [1, 2, 3, 4]
 
     tail = await repo.get_messages(s.id, after_seq=2)
-    assert [m.seq for m in tail] == [3, 4]
+    assert [m.seq for m in tail] == [3, 4]  # 严格大于游标
 
     empty = await repo.get_messages(s.id, after_seq=4)
     assert empty == []
@@ -191,6 +215,7 @@ async def test_append_message_records_usage_and_stop_reason(repo: Repository) ->
     assert msg.cache_read == 3
     assert msg.cache_creation == 2
 
+    # 列名风格的 usage 键也支持
     msg2 = await repo.append_message(
         s.id,
         "assistant",
@@ -200,8 +225,14 @@ async def test_append_message_records_usage_and_stop_reason(repo: Repository) ->
     assert msg2.cache_read == 9
     assert msg2.cache_creation == 8
 
+    # 缺省 usage → 全 0
     msg3 = await repo.append_message(s.id, "user", [{"type": "text", "text": "y"}])
     assert (msg3.input_tokens, msg3.output_tokens, msg3.cache_read, msg3.cache_creation) == (0, 0, 0, 0)
+
+
+# ----------------------------------------------------------------------
+# sessions 用量：增量累加
+# ----------------------------------------------------------------------
 
 
 async def test_update_session_usage_accumulates(repo: Repository) -> None:
@@ -230,6 +261,11 @@ async def test_update_session_usage_zero_delta_touches_timestamp(repo: Repositor
     after = await repo.update_session_usage(s.id)
     assert after is not None
     assert after.updated_at >= before
+
+
+# ----------------------------------------------------------------------
+# tool_calls：落表后可查询
+# ----------------------------------------------------------------------
 
 
 async def test_record_and_list_tool_calls(repo: Repository) -> None:

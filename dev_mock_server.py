@@ -1,3 +1,35 @@
+"""无 ANTHROPIC_API_KEY 的开发/联调 mock 服务器（基建）。
+
+手法与 tests/test_api.py 一致：monkeypatch ``app.main.build_session_manager``
+注入脚本化 FakeLLM，绝不发起真实 API 调用。区别在于脚本按「场景」组织，
+且按消息内容自动路由——同一个服务器可同时服务多个会话、多种场景。
+
+场景路由（按最后一条用户消息的关键词，MOCK_SCENARIO 环境变量可强制固定）：
+  chat 默认：纯文本流式回答（含 thinking / usage / cache_read 演示）
+  file 关键词 文件/read/file/读：第一轮调 read_file 工具 → 第二轮回答
+  approval 关键词 审批/deploy/部署/approval：dangerous 工具触发审批流，
+            第二轮按审批结果分支（allow → 汇报成功；deny → 提议替代方案）
+  slow 关键词 slow/慢：慢速逐字输出（断线重连测试用，MOCK_DELTA_DELAY 可调）
+  error 关键词 error/报错：LLM 调用抛异常 → error 事件链路演示
+  workspace 关键词 工作区/workspace：agent 自主调 add_workspace_dir 把演示
+            子目录加入多目录工作区 → read_file 跨目录读取（联调）
+  tools 关键词 工具目录/发现工具/discover：discover_tools → install
+            （审批，deny 则降级 run_python 兜底）→ 同一 run 调用新装的
+            MCP 工具（自扩展 Agent 联调）
+
+无状态设计：FakeLLM 不持有跨调用状态——场景由「最后一条用户消息」决定，
+迭代序号由「messages 里 tool_result 块的个数」推导，因此多会话并发安全，
+也天然容忍 agent loop 的重试/续传行为。
+
+启动：
+    cd backend && .venv/Scripts/python dev_mock_server.py
+    # 或 uvicorn dev_mock_server:app --port 8000
+环境变量：
+    MOCK_DATABASE_URL 默认 sqlite+aiosqlite:///./data/dev_mock.db
+    MOCK_SCENARIO 强制所有消息走指定场景（chat/file/approval/slow/error/workspace）
+    MOCK_DELTA_DELAY 每个 delta 之间的延迟秒数（默认 0；slow 场景默认 0.25）
+    MOCK_PORT 监听端口（默认 8000）
+"""
 
 from __future__ import annotations
 
@@ -9,37 +41,49 @@ from pathlib import Path
 from typing import Any
 
 os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///./data/dev_mock.db")
+# 播种种子与 demo 工作区对齐：真实 lifespan 用 config workspace_root
+# 播种 workspace_dirs 表——mock 服务器把它指到 demo 工作区，file/workspace
+# 场景的 read_file 才有东西可读。
 os.environ.setdefault("WORKSPACE_ROOT", "../workspace")
 
-from app.core.config import get_settings
-from app.core.dispatcher import ToolDispatcher
-from app.db.database import get_sessionmaker
-from fastapi import Request
-from app.core.llm_client import LLMTurnResult, StreamDelta, UsageData
-from app.core.session_manager import SessionManager
-from app.tools.builtin import register_default_tools
-from app.tools.registry import ToolRegistry, ToolSpec
+from app.core.config import get_settings  # noqa: E402
+from app.core.dispatcher import ToolDispatcher  # noqa: E402
+from app.db.database import get_sessionmaker  # noqa: E402
+from fastapi import Request  # noqa: E402
+from app.core.llm_client import LLMTurnResult, StreamDelta, UsageData  # noqa: E402
+from app.core.session_manager import SessionManager  # noqa: E402
+from app.tools.builtin import register_default_tools  # noqa: E402
+from app.tools.registry import ToolRegistry, ToolSpec  # noqa: E402
 
 WORKSPACE_ROOT = Path("../workspace/")
 
-DELTA_CHUNK = 8
+DELTA_CHUNK = 8  # 文本按多少字符切一个 delta
+
+
+# ----------------------------------------------------------------------
+# 场景脚本
+# ----------------------------------------------------------------------
 
 
 @dataclass
 class MockTurn:
+    """一次 run 中第 N 次迭代应返回的 LLM 结果（含要回放的 deltas）。"""
 
     text: str = ""
     thinking: str | None = None
-    tool_use: dict[str, Any] | None = None
+    tool_use: dict[str, Any] | None = None  # {"name", "input"}（id 自动生成）
     stop_reason: str = "end_turn"
     usage: UsageData = field(
         default_factory=lambda: UsageData(input_tokens=120, output_tokens=30, cache_read=100)
     )
-    delta_delay: float | None = None
+    delta_delay: float | None = None  # None → 用全局 MOCK_DELTA_DELAY
+    # 占位 turn（text 与 tool_use 均空）的自定义分支器：bool(上轮 is_error)
+    # → MockTurn。缺省走 approval 场景的 _resolve_branch_turn。
     branch: Any = None
 
 
 def _fallback_turn() -> MockTurn:
+    """迭代序号超出脚本长度时的兜底（正常到不了：脚本覆盖到 end_turn）。"""
     return MockTurn(text="(mock) 继续。", usage=UsageData(80, 10, 70))
 
 
@@ -81,6 +125,7 @@ def scenario_approval() -> list[MockTurn]:
             stop_reason="tool_use",
             usage=UsageData(input_tokens=150, output_tokens=20, cache_read=130),
         ),
+        # 第二轮在运行时按 tool_result 的 is_error 分支（见 FakeLLM._turn_for）
         MockTurn(text=""),
     ]
 
@@ -97,10 +142,12 @@ def scenario_slow() -> list[MockTurn]:
 
 
 def scenario_error() -> list[MockTurn]:
-    return [RuntimeError("(mock) simulated LLM outage")]
+    # turns 列表里放异常实例 → FakeLLM 原样上抛 → AgentLoop 归一化 error 事件
+    return [RuntimeError("(mock) simulated LLM outage")]  # type: ignore[list-item]
 
 
 def _ensure_workspace_demo_dir() -> Path:
+    """workspace 场景的演示子目录：启动时建好并写入一个文件。"""
     demo_dir = (WORKSPACE_ROOT / "extra_dir").resolve()
     demo_dir.mkdir(parents=True, exist_ok=True)
     note = demo_dir / "extra.txt"
@@ -114,6 +161,11 @@ def _ensure_workspace_demo_dir() -> Path:
 
 
 def scenario_workspace() -> list[MockTurn]:
+    """ 联调演示：agent 自主 add_workspace_dir → 跨目录 read_file。
+
+    即使 add 因重复被拒（目录已在工作区），read 仍走绝对路径成功——脚本
+    对两种结果都成立。最后一步用 list_workspace_dirs 报当前目录集合。
+    """
     demo_dir = _ensure_workspace_demo_dir()
     return [
         MockTurn(
@@ -150,6 +202,11 @@ def scenario_workspace() -> list[MockTurn]:
 
 
 def scenario_tools() -> list[MockTurn]:
+    """ 联调演示：discover_tools → install_mcp_server（审批门）→
+    **同一 run** 下一迭代调用新装的 mcp__text_tools__reverse_text。
+
+    install 被拒（审批 deny → is_error）时自动降级 run_python 兜底——
+    正好演示"没有工具就直接写代码干"的自扩展闭环。"""
     return [
         MockTurn(
             text="我先在精选工具目录里搜一下有没有能做文本反转的工具。",
@@ -164,7 +221,7 @@ def scenario_tools() -> list[MockTurn]:
             stop_reason="tool_use",
             usage=UsageData(input_tokens=210, output_tokens=34, cache_read=180),
         ),
-        MockTurn(text="", branch=resolve_tools_install_branch),
+        MockTurn(text="", branch=resolve_tools_install_branch),  # 占位：按 install 结果分支
         MockTurn(
             text="自扩展闭环走通：discover_tools 检索 → install_mcp_server 过审批门"
             "（成功后后端向全部会话广播 tools_changed，前端会 toast「工具集已更新」）"
@@ -176,6 +233,7 @@ def scenario_tools() -> list[MockTurn]:
 
 
 def resolve_tools_install_branch(denied: bool) -> MockTurn:
+    """tools 场景第 3 轮分支：install 成功 → 调新装工具；被拒 → run_python 兜底。"""
     if denied:
         return MockTurn(
             text="收到审批结果：**未获批准**。没关系——run_python 沙箱是万能兜底，"
@@ -199,7 +257,7 @@ def resolve_tools_install_branch(denied: bool) -> MockTurn:
     )
 
 
-SCENARIOS: dict[str, callable] = {
+SCENARIOS: dict[str, callable] = {  # type: ignore[assignment]
     "chat": scenario_chat,
     "file": scenario_file,
     "approval": scenario_approval,
@@ -230,7 +288,16 @@ def route_scenario(last_user_text: str) -> str:
     return "chat"
 
 
+# ----------------------------------------------------------------------
+# FakeLLM：无状态脚本回放（tests/test_api.py ScriptedLLM 的场景化版本）
+# ----------------------------------------------------------------------
+
+
 class FakeLLM:
+    """按场景脚本回放 turns；异常实例直接抛出（error 场景）。
+
+    迭代定位：messages 中 tool_result 块的个数 = 当前迭代序号（0 起）。
+    """
 
     def __init__(self) -> None:
         self.calls: list[dict[str, Any]] = []
@@ -245,6 +312,7 @@ class FakeLLM:
         turn = turns[index] if index < len(turns) else _fallback_turn()
         if isinstance(turn, BaseException):
             raise turn
+        # 占位 turn（approval/tools 场景）：按本轮 tool_result 的 is_error 分支
         if turn.text == "" and turn.tool_use is None:
             if turn.branch is not None:
                 denied = self._last_tool_is_error(self._current_run_messages(messages))
@@ -262,6 +330,7 @@ class FakeLLM:
 
         return self._result_of(turn)
 
+    # ---- 内部 ----
 
     @staticmethod
     def _global_delay() -> float:
@@ -276,6 +345,9 @@ class FakeLLM:
 
     @staticmethod
     def _current_run_messages(messages: list) -> list:
+        """取「本轮」的消息后缀：最后一条含 text 块的 user 消息 = 本轮用户输入，
+        其之前的历史（含之前 run 的 tool_result）不参与迭代定位——否则多 run
+        会话里迭代序号会被历史污染（联调实测踩到的坑）。"""
         last_text_user = -1
         for i, m in enumerate(messages):
             if m.get("role") != "user":
@@ -305,6 +377,7 @@ class FakeLLM:
         return False
 
     def _resolve_branch_turn(self, turn: MockTurn, messages: list) -> MockTurn:
+        """approval 场景第二轮：占位空 turn 按审批结果（本轮 tool_result.is_error）分支。"""
         denied = self._last_tool_is_error(self._current_run_messages(messages))
         if denied:
             return MockTurn(
@@ -368,7 +441,21 @@ def _last_user_text(messages: list) -> str:
     return ""
 
 
+# ----------------------------------------------------------------------
+# 组装：真实引擎（SessionManager/AgentLoop/DB/总线）+ FakeLLM + demo 工具
+# ----------------------------------------------------------------------
+
+
 def build_demo_registry(workspace_service=None) -> ToolRegistry:
+    """真实 builtin 工具 + 一个 dangerous 演示工具（审批流用）+ 元工具。
+
+    workspace_service：传入真实 lifespan 构建的 WorkspaceRegistry
+    时，read_file / search_workspace 走 provider 模式（执行时实时查询目录
+    集合），并注册工作区管理三工具——agent 可自主增删、前端可管理。
+    元工具：discover/install/uninstall/run_python——catalog、
+    MCPManager、广播回调与真实 app 共享（app.main 模块级持有者，lifespan
+    已构建；MCPManager 经 provider 迟绑定，安装真实 catalog demo server）。
+    """
     WORKSPACE_ROOT.mkdir(parents=True, exist_ok=True)
     notes = WORKSPACE_ROOT / "notes.txt"
     if not notes.exists():
@@ -398,7 +485,7 @@ def build_demo_registry(workspace_service=None) -> ToolRegistry:
         )
 
     async def deploy_handler(tool_input: dict[str, Any]) -> dict[str, Any]:
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.1)  # 模拟部署耗时
         return {
             "status": "deployed",
             "env": tool_input.get("env"),
@@ -426,12 +513,19 @@ def build_demo_registry(workspace_service=None) -> ToolRegistry:
 
 
 def fake_build_session_manager(bus):
+    """替换 app.main.build_session_manager：真实引擎 + FakeLLM + demo 工具。
+
+    工作区服务与真实 app 共享：real lifespan 已把 WorkspaceRegistry
+    挂到 app.state.workspaces 并注册进 app.main 的模块级持有者——这里取同一
+    实例构建工具，/api/workspaces 的增删对 demo 工具即刻生效。
+    """
     from app.main import get_workspace_service
 
     settings = get_settings()
     registry = build_demo_registry(get_workspace_service())
 
     def dispatcher_factory(approve_callback):
+        # registry 只读共享；dispatcher 每会话独立（审批回调/熔断按会话隔离）
         return ToolDispatcher(
             registry,
             approve_callback=approve_callback,
@@ -454,6 +548,7 @@ def fake_build_session_manager(bus):
 
 
 def create_mock_app():
+    """打补丁后的 FastAPI app（复用真实 app.main 的全部路由与生命周期）。"""
     import app.main as main_mod
     from fastapi.responses import JSONResponse
 
@@ -463,10 +558,15 @@ def create_mock_app():
 
     @real_app.post("/api/mock/drop_sse/{session_id}")
     async def drop_sse(session_id: str, request: Request) -> JSONResponse:
+        """[联调工具] 硬断某会话的全部 SSE 订阅（模拟网络杀连接）。
+
+        只向订阅者队列投递关闭哨兵：客户端看到流结束 → 指数退避 → 带
+        after_seq 重连重放。总线缓冲与会话状态原样保留（区别于 close_session）。
+        """
         manager = getattr(real_app.state, "sessions", None)
         if manager is None:
             return JSONResponse({"ok": False, "error": "manager not ready"}, status_code=503)
-        state = manager.bus._states.get(session_id)
+        state = manager.bus._states.get(session_id)  # noqa: SLF001 dev 工具允许
         if state is None:
             return JSONResponse({"ok": True, "session_id": session_id, "dropped": 0})
         from app.core.event_bus import _CLOSE, _push

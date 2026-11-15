@@ -1,3 +1,9 @@
+"""权限控制测试——矩阵逐格 + 新工具 + 全局开关传播/持久化。
+
+矩阵事实来源：dispatcher.PERMISSION_MATRIX（read/write/full × read/write/
+execute/admin → allow/approval）。全部走 dispatcher.dispatch 真实流水线
+（含审批回调），不 mock 内部方法。
+"""
 
 from __future__ import annotations
 
@@ -17,6 +23,10 @@ from app.db.models import Base
 from app.db.repository import Repository
 from app.schemas.events import SSEEvent
 from app.tools.registry import ToolRegistry, ToolSpec
+
+# ----------------------------------------------------------------------
+# 矩阵夹具：四类 access 各一个工具 + 记录型审批回调
+# ----------------------------------------------------------------------
 
 
 def build_access_registry() -> ToolRegistry:
@@ -43,7 +53,7 @@ def build_access_registry() -> ToolRegistry:
 def make_dispatcher(mode: str, approvals: list[str]) -> ToolDispatcher:
     async def approve(tool_name: str, tool_input: Any) -> bool:
         approvals.append(tool_name)
-        return False
+        return False  # 一律拒绝：审批命中即可断言，放行由 allow 档验证
 
     return ToolDispatcher(
         build_access_registry(), approve_callback=approve, retry_backoff_base_s=0,
@@ -58,7 +68,7 @@ async def test_full_mode_allows_everything(access: str) -> None:
     dispatcher = make_dispatcher("full", approvals)
     result = await dispatcher.dispatch(f"tool_{access}", {})
     assert result.ok
-    assert approvals == []
+    assert approvals == []  # 全开放：危险工具也免审批
 
 
 @pytest.mark.asyncio
@@ -78,7 +88,7 @@ async def test_write_mode_gates_admin() -> None:
     result = await dispatcher.dispatch("tool_admin", {})
     assert not result.ok
     assert result.code == "approval_denied"
-    assert approvals == ["tool_admin"]
+    assert approvals == ["tool_admin"]  # 走了审批回调（回调拒绝 → denied）
 
 
 @pytest.mark.asyncio
@@ -115,11 +125,16 @@ def test_invalid_mode_rejected() -> None:
 async def test_mode_hot_switch_takes_effect() -> None:
     approvals: list[str] = []
     dispatcher = make_dispatcher("full", approvals)
-    assert (await dispatcher.dispatch("tool_write", {})).ok
+    assert (await dispatcher.dispatch("tool_write", {})).ok  # full 直行
     dispatcher.set_permission_mode("read")
     result = await dispatcher.dispatch("tool_write", {})
-    assert not result.ok
+    assert not result.ok  # 切到 read → 写类立刻受审批门控
     assert approvals == ["tool_write"]
+
+
+# ----------------------------------------------------------------------
+# 新工具：write_file / delete_file / run_command（full 模式直行）
+# ----------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -195,10 +210,10 @@ async def test_delete_file_removes_and_guards(tmp_path: Path, tool_db) -> None:
 
     nonempty = await dispatcher.dispatch("delete_file", {"path": "full"})
     assert not nonempty.ok and "dir_not_empty" in nonempty.content
-    assert (root / "full" / "keep.txt").exists()
+    assert (root / "full" / "keep.txt").exists()  # 非空目录未被递归删除
 
     protected = await dispatcher.dispatch("delete_file", {"path": str(root)})
-    assert not protected.ok
+    assert not protected.ok  # 工作区根本身受保护
 
 
 @pytest.mark.asyncio
@@ -208,7 +223,7 @@ async def test_run_command_echoes(tmp_path: Path, tool_db) -> None:
     dispatcher = workspace_dispatcher(root)
     result = await dispatcher.dispatch("run_command", {"command": "echo hello"})
     assert result.ok, result.content
-    assert "hello" in result.content
+    assert "hello" in result.content  # stdout 捕获（bash / cmd 皆然）
 
 
 @pytest.mark.asyncio
@@ -216,6 +231,11 @@ async def test_run_command_rejects_empty(tmp_path: Path, tool_db) -> None:
     dispatcher = workspace_dispatcher(tmp_path)
     result = await dispatcher.dispatch("run_command", {"command": "  "})
     assert not result.ok and "invalid_params" in result.content
+
+
+# ----------------------------------------------------------------------
+# SessionManager：全局模式传播 + 持久化
+# ----------------------------------------------------------------------
 
 
 class FakeLoop:
@@ -260,7 +280,7 @@ async def test_set_permission_mode_propagates_to_running_loops() -> None:
     manager = build_manager(factory)
     from app.core.event_bus import SessionEventBus
 
-    rs = manager.start_session.__self__ if False else None
+    rs = manager.start_session.__self__ if False else None  # 占位，下面手工构造
     from app.core.session_manager import RunningSession
 
     rs = RunningSession(
@@ -285,8 +305,14 @@ async def test_set_permission_mode_invalid() -> None:
     await engine.dispose()
 
 
+# ----------------------------------------------------------------------
+# API：GET/PUT /api/permissions + 重启恢复
+# ----------------------------------------------------------------------
+
+
 @pytest.fixture
 async def perm_api(tmp_path, monkeypatch):
+    """隔离 DB + 真实 SessionManager（mock LLM 永不被调用）+ 手动 lifespan。"""
     import app.main as main_mod
 
     db_path = (tmp_path / "perm_test.db").as_posix()
@@ -332,11 +358,12 @@ async def test_permissions_put_switches(perm_api) -> None:
 async def test_permissions_put_rejects_unknown(perm_api) -> None:
     client, _app, _db = perm_api
     resp = await client.put("/api/permissions", json={"mode": "sudo"})
-    assert resp.status_code == 422
+    assert resp.status_code == 422  # pydantic Literal 校验
 
 
 @pytest.mark.asyncio
 async def test_permission_mode_survives_restart(perm_api) -> None:
+    """切换 → 重建 app（同库）→ 权限模式从 app_settings 恢复。"""
     import app.main as main_mod
 
     client, _app, db_path = perm_api
@@ -352,6 +379,7 @@ async def test_permission_mode_survives_restart(perm_api) -> None:
 
 @pytest.mark.asyncio
 async def test_session_events_envelope_shape(perm_api) -> None:
+    """守卫断言：权限事件不影响 SSE 信封（顺带验证 app 可正常构建事件）。"""
     from app.schemas.events import SSEEventType, make_event
 
     event = make_event(1, SSEEventType.ERROR, {"code": "x", "message": "y"})
