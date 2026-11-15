@@ -1,11 +1,3 @@
-"""API 层集成测试 —— httpx AsyncClient + ASGITransport 覆盖 全部 9 端点。
-
-全部 mock LLM（monkeypatch app.main.build_session_manager 注入 ScriptedLLM），
-绝不发起真实 API 调用。覆盖：创建/列表/详情/删除、POST messages 202、
-GET messages 增量、SSE 端点真流式断言（event: 行 / data JSON 可解析 /
-seq 单调）、审批 allow/deny 后流程继续、interrupt、404 路径、健康检查、
-统一 JSON 错误格式。
-"""
 
 from __future__ import annotations
 
@@ -22,13 +14,7 @@ from app.core.llm_client import LLMTurnResult, StreamDelta, UsageData
 from app.db.database import dispose_engine, get_sessionmaker
 
 
-# ----------------------------------------------------------------------
-# mock LLM
-# ----------------------------------------------------------------------
-
-
 class ScriptedLLM:
-    """脚本化 mock LLM：按序回放 turns（可附 deltas）；异常实例直接抛出。"""
 
     def __init__(self) -> None:
         self.turns: list[Any] = []
@@ -49,7 +35,6 @@ class ScriptedLLM:
 
 
 class BlockingLLM:
-    """挂在 run_turn 上的 mock LLM（interrupt / 删除运行中会话测试用）。"""
 
     def __init__(self) -> None:
         self.started = asyncio.Event()
@@ -84,11 +69,6 @@ def tool_use_turn(tid: str, tool_name: str, tool_input: dict) -> LLMTurnResult:
     )
 
 
-# ----------------------------------------------------------------------
-# app 夹具：隔离 DB + 注入 mock LLM + 手动跑 lifespan
-# ----------------------------------------------------------------------
-
-
 @pytest.fixture
 async def api(tmp_path, monkeypatch):
     import app.main as main_mod
@@ -105,7 +85,7 @@ async def api(tmp_path, monkeypatch):
 
     def fake_build_session_manager(bus):
         settings = get_settings()
-        registry = ToolRegistry()  # 空 registry：API 层测试不依赖具体工具
+        registry = ToolRegistry()
 
         def dispatcher_factory(approve_callback):
             return ToolDispatcher(
@@ -194,19 +174,12 @@ def parse_frame(raw: str) -> tuple[str, dict]:
 async def read_frames(
     application, path: str, count: int, timeout: float = 5.0
 ) -> tuple[int, dict, list[tuple[str, dict]]]:
-    """真流式读取 SSE：手动驱动 ASGI app，增量收集响应体消息。
-
-    httpx 的 ASGITransport 会把整个响应体缓冲到 ASGI app 结束才返回，
-    对永不结束的 SSE 流不适用；这里直接按 ASGI 协议驱动 app，
-    逐条 http.response.body 消息实时解析 SSE 帧。
-    """
     frames: list[tuple[str, dict]] = []
     buf = ""
     status: dict = {}
     headers: dict = {}
 
     async def receive():
-        # 永不发 disconnect（保持流的活性）；由外层超时/取消结束
         await asyncio.sleep(3600)
         return {"type": "http.disconnect"}
 
@@ -222,10 +195,10 @@ async def read_frames(
             ready, buf = split_frames(buf)
             for raw in ready:
                 if raw.startswith(":"):
-                    continue  # 心跳注释帧（`: ping`），SSE 规范要求客户端忽略
+                    continue
                 frames.append(parse_frame(raw))
             if len(frames) >= count:
-                return  # 已收够，外层 done 事件已置位
+                return
 
     task = asyncio.create_task(application(_scope(path), receive, send))
     try:
@@ -237,7 +210,6 @@ async def read_frames(
 
 
 async def read_raw_stream(application, path: str, duration: float) -> str:
-    """按时长收集 SSE 流的原始字节（心跳/保活断言用，不做帧解析）。"""
     chunks: list[str] = []
 
     async def receive():
@@ -280,11 +252,6 @@ async def _wait_frames(frames, count) -> None:
         await asyncio.sleep(0.01)
 
 
-# ----------------------------------------------------------------------
-# 健康检查 / 会话 CRUD
-# ----------------------------------------------------------------------
-
-
 async def test_health(api):
     client, _, _ = api
     resp = await client.get("/health")
@@ -296,7 +263,6 @@ async def test_health(api):
 
 async def test_create_list_get_delete_session(api):
     client, _, _ = api
-    # POST /sessions → 201
     created = await create_session(client, model="m-test", effort="low", title="t1")
     assert created["id"]
     assert created["status"] == "idle"
@@ -305,25 +271,16 @@ async def test_create_list_get_delete_session(api):
     assert created["title"] == "t1"
     assert created["total_input_tokens"] == 0
 
-    # GET /sessions → 列表包含
     listed = (await client.get("/api/sessions")).json()
     assert any(s["id"] == created["id"] for s in listed)
 
-    # GET /sessions/{id} → 详情
     detail = (await client.get(f"/api/sessions/{created['id']}")).json()
     assert detail["id"] == created["id"]
 
-    # DELETE → 204，再查 404
     resp = await client.delete(f"/api/sessions/{created['id']}")
     assert resp.status_code == 204
     assert (await client.get(f"/api/sessions/{created['id']}")).status_code == 404
-    # 重复删除 → 404
     assert (await client.delete(f"/api/sessions/{created['id']}")).status_code == 404
-
-
-# ----------------------------------------------------------------------
-# 消息端点
-# ----------------------------------------------------------------------
 
 
 async def test_post_message_returns_202_and_processes(api):
@@ -337,13 +294,11 @@ async def test_post_message_returns_202_and_processes(api):
     assert resp.json() == {"ok": True, "session_id": session["id"], "queued": True}
 
     await wait_run_done(application, session["id"])
-    # 消息被真实消费：历史里有 user + assistant
     messages = (await client.get(f"/api/sessions/{session['id']}/messages")).json()
     assert [m["role"] for m in messages] == ["user", "assistant"]
     assert messages[0]["content"][0]["text"] == "hello"
     assert messages[1]["content"][0]["text"] == "answer one"
 
-    # 404：会话不存在
     resp = await client.post("/api/sessions/ghost/messages", json={"text": "x"})
     assert resp.status_code == 404
 
@@ -358,25 +313,18 @@ async def test_get_messages_incremental_after_seq(api):
     await wait_run_done(application, session["id"])
 
     all_messages = (await client.get(f"/api/sessions/{session['id']}/messages")).json()
-    assert len(all_messages) == 4  # user, assistant, user, assistant
+    assert len(all_messages) == 4
     seqs = [m["seq"] for m in all_messages]
     assert seqs == [1, 2, 3, 4]
 
-    # 增量：after_seq=2 → 只返回 seq>2 的两条
     incremental = (
         await client.get(f"/api/sessions/{session['id']}/messages?after_seq=2")
     ).json()
     assert [m["seq"] for m in incremental] == [3, 4]
 
-    # 404
     assert (
         await client.get("/api/sessions/ghost/messages")
     ).status_code == 404
-
-
-# ----------------------------------------------------------------------
-# SSE 端点：真流式断言
-# ----------------------------------------------------------------------
 
 
 async def test_sse_stream_wire_format_and_seq_monotonic(api):
@@ -396,8 +344,7 @@ async def test_sse_stream_wire_format_and_seq_monotonic(api):
     kinds = [kind for kind, _ in frames]
     assert kinds == ["text_delta", "turn_complete"]
     seqs = [data["seq"] for _, data in frames]
-    assert seqs == [1, 2]  # seq 单调
-    # 信封结构 {"seq","type","data"}
+    assert seqs == [1, 2]
     assert frames[0][1]["type"] == "text_delta"
     assert frames[0][1]["data"] == {"text": "streamed answer"}
     assert frames[1][1]["type"] == "turn_complete"
@@ -413,14 +360,12 @@ async def test_sse_incremental_cursor_after_seq(api):
     await client.post(f"/api/sessions/{session['id']}/messages", json={"text": "q1"})
     await wait_run_done(application, session["id"])
 
-    # after_seq=1 → 只重放 turn_complete（seq=2），随后实时
     _, _, frames = await read_frames(
         application, f"/api/sessions/{session['id']}/events?after_seq=1", count=1
     )
     assert frames[0][0] == "turn_complete"
     assert frames[0][1]["seq"] == 2
 
-    # 第二条消息的事件实时推送过来
     scripted.turns = [end_turn("two")]
     scripted.deltas = [[StreamDelta(kind="text", text="two")]]
     await client.post(f"/api/sessions/{session['id']}/messages", json={"text": "q2"})
@@ -433,24 +378,21 @@ async def test_sse_incremental_cursor_after_seq(api):
 
 
 async def test_sse_heartbeat_ping_keeps_idle_stream_alive(api, monkeypatch):
-    """空闲超过心跳间隔 → 流内出现 `: ping` 注释帧（SSE 规范注释，客户端
-    忽略），治本代理掐空闲连接导致的重连风暴（真实模式缺陷 #2）。"""
     from app.api import events as events_module
 
     monkeypatch.setattr(events_module, "SSE_PING_INTERVAL_S", 0.2)
     client, application, _ = api
-    session = await create_session(client)  # 无任何事件的会话
+    session = await create_session(client)
 
     raw = await read_raw_stream(
         application, f"/api/sessions/{session['id']}/events?after_seq=0", duration=1.0
     )
-    assert ": ping" in raw  # 心跳存在
-    assert raw.count(": ping") >= 3  # 周期性发送（0.2s 间隔 / 1s 窗口 ≥ 3 次）
-    assert "event:" not in raw  # 空会话：只有心跳，无事件帧混入
+    assert ": ping" in raw
+    assert raw.count(": ping") >= 3
+    assert "event:" not in raw
 
 
 async def test_sse_heartbeat_interleaves_with_events(api, monkeypatch):
-    """心跳与事件帧共存：事件到达顺序与 seq 不受心跳影响。"""
     from app.api import events as events_module
 
     monkeypatch.setattr(events_module, "SSE_PING_INTERVAL_S", 0.05)
@@ -465,19 +407,12 @@ async def test_sse_heartbeat_interleaves_with_events(api, monkeypatch):
         application, f"/api/sessions/{session['id']}/events?after_seq=0", count=2
     )
     assert status == 200
-    assert [data["seq"] for _, data in frames] == [1, 2]  # 心跳不影响 seq 连续性
-
-
-# ----------------------------------------------------------------------
-# 审批端点
-# ----------------------------------------------------------------------
+    assert [data["seq"] for _, data in frames] == [1, 2]
 
 
 async def seed_approval_scenario(client, application, scripted) -> str:
     session = await create_session(client)
     scripted.turns = [tool_use_turn("tu_r", "risky", {"text": "rm"}), end_turn("ok done")]
-    # risky 未注册在空 registry → dispatcher 会报 unknown_tool 而非走审批门。
-    # 注册一个 dangerous 工具到会话的 registry（API 夹具的 registry 为会话共享）。
     manager = manager_of(application)
     from app.tools.registry import ToolSpec
 
@@ -497,7 +432,7 @@ async def seed_approval_scenario(client, application, scripted) -> str:
             handler=risky_handler,
             timeout_s=5,
             dangerous=True,
-            access="execute",  # 审批门由权限矩阵按 access 判定
+            access="execute",
         )
     )
     await client.post(f"/api/sessions/{session['id']}/messages", json={"text": "go"})
@@ -532,8 +467,7 @@ async def test_approval_allow_completes_flow(api):
     tool_result = next(
         b for m in messages for b in m["content"] if b["type"] == "tool_result"
     )
-    assert tool_result["is_error"] is False  # allow → 工具真实执行
-    # 再次审批同一 tool_use_id → 404（已决议）
+    assert tool_result["is_error"] is False
     resp = await client.post(
         f"/api/sessions/{session_id}/approvals/tu_r", json={"result": "allow"}
     )
@@ -545,7 +479,6 @@ async def test_approval_deny_and_unknown_pending_404(api):
     session_id = await seed_approval_scenario(client, application, scripted)
     manager = manager_of(application)
 
-    # 无此 pending → 404
     resp = await client.post(
         f"/api/sessions/{session_id}/approvals/tu_ghost", json={"result": "allow"}
     )
@@ -568,20 +501,13 @@ async def test_approval_deny_and_unknown_pending_404(api):
     tool_result = next(
         b for m in messages for b in m["content"] if b["type"] == "tool_result"
     )
-    assert tool_result["is_error"] is True  # deny → is_error 链路回给模型
-    # deny 后模型换路：仍然走到 end_turn 收尾
+    assert tool_result["is_error"] is True
     assert messages[-1]["content"][0]["text"] == "ok done"
 
-    # 非法 result 值 → 422
     resp = await client.post(
         f"/api/sessions/{session_id}/approvals/tu_x", json={"result": "maybe"}
     )
     assert resp.status_code == 422
-
-
-# ----------------------------------------------------------------------
-# interrupt 端点
-# ----------------------------------------------------------------------
 
 
 async def test_interrupt_running_session(api):
@@ -599,7 +525,6 @@ async def test_interrupt_running_session(api):
     assert resp.json() == {"ok": True, "session_id": session["id"], "interrupted": True}
     await wait_run_done(application, session["id"])
 
-    # 打断后可继续正常对话
     scripted.turns = [end_turn("after interrupt")]
     manager.llm = scripted
     resp = await client.post(
@@ -610,7 +535,6 @@ async def test_interrupt_running_session(api):
     messages = (await client.get(f"/api/sessions/{session['id']}/messages")).json()
     assert messages[-1]["content"][0]["text"] == "after interrupt"
 
-    # 无运行中 run → interrupted=false 仍 200；未知会话 → 404
     resp = await client.post(f"/api/sessions/{session['id']}/interrupt")
     assert resp.status_code == 200
     assert resp.json()["interrupted"] is False
@@ -630,11 +554,6 @@ async def test_delete_running_session_stops_it(api):
     assert resp.status_code == 204
     await wait_until(lambda: manager.get_running(session["id"]) is None)
     assert (await client.get(f"/api/sessions/{session['id']}")).status_code == 404
-
-
-# ----------------------------------------------------------------------
-# 404 路径与统一错误格式
-# ----------------------------------------------------------------------
 
 
 async def test_error_shape_unified_json(api):

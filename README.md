@@ -1,5 +1,7 @@
 # AgentCommon
 
+English | [简体中文](README.zh-CN.md)
+
 A general-purpose LLM agent backend with tool calling (Tools / MCP / Skills),
 streaming interaction (SSE), approval gates, and a self-extending tool
 ecosystem — built with Python 3.12 + FastAPI + SQLAlchemy (async).

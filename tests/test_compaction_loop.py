@@ -1,10 +1,3 @@
-"""AgentLoop × compaction 集成测试（）—— mock client，无真实 API。
-
-覆盖：should_compact 钩子接通（接近阈值触发 compact）、完整 response.content
-（含 compaction 块）回传进历史并落库、compaction 失败降级不阻塞主循环、
-每 run 至多压缩一次、未配置 compactor 时行为与基线一致、cost_usd 真实
-计算值随 turn_complete / update_session_usage 通道下发（联动）。
-"""
 
 from __future__ import annotations
 
@@ -23,11 +16,6 @@ from app.db.models import Base
 from app.db.repository import Repository
 from app.schemas.events import SSEEvent, SSEEventType
 from app.tools.registry import ToolRegistry, ToolSpec
-
-
-# ----------------------------------------------------------------------
-# 夹具
-# ----------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -82,7 +70,6 @@ class ScriptedLLM:
 
 
 class MockCompactClient:
-    """beta.messages.compact mock：记录入参，回放完整 compaction content。"""
 
     def __init__(self, content: list[dict[str, Any]]) -> None:
         self._content = content
@@ -130,21 +117,15 @@ def make_loop(repo: Repository, registry: ToolRegistry, llm: ScriptedLLM, **kwar
     )
 
 
-# ----------------------------------------------------------------------
-# should_compact 钩子 → compact → 完整 content 回传
-# ----------------------------------------------------------------------
-
-
 async def test_compaction_triggers_and_full_content_round_tripped(
     repo: Repository, registry: ToolRegistry
 ) -> None:
-    """超阈值轮次触发 compaction；完整 content（含 compaction 块）落库并进历史。"""
     session = await repo.create_session(model="claude-opus-4-8", effort="high")
     llm = ScriptedLLM([
         LLMTurnResult(
             content=[{"type": "text", "text": "final"}],
             stop_reason="end_turn",
-            usage=big_usage(200),  # >= threshold(100) → 触发
+            usage=big_usage(200),
         ),
     ])
     client = MockCompactClient(COMPACTION_CONTENT)
@@ -158,16 +139,13 @@ async def test_compaction_triggers_and_full_content_round_tripped(
     assert len(client.calls) == 1
     call = client.calls[0]
     assert call["betas"] == [COMPACTION_BETA]
-    # 传给 compact 的 messages 含本轮用户输入（合并后的历史）
     assert any(
         b.get("text") == "hello"
         for m in call["messages"] for b in m["content"]
     )
-    # 关键坑回归：完整 content（含 compaction 块）作为 assistant 消息落库
     messages = await repo.get_messages(session.id)
     contents = [m.content for m in messages]
     assert COMPACTION_CONTENT in contents
-    # 且排在本轮最终 assistant 消息之前（compaction 先回传，终态消息后落）
     assert contents.index(COMPACTION_CONTENT) == 1
     assert contents[-1] == [{"type": "text", "text": "final"}]
 
@@ -175,7 +153,6 @@ async def test_compaction_triggers_and_full_content_round_tripped(
 async def test_compaction_once_per_run(
     repo: Repository, registry: ToolRegistry
 ) -> None:
-    """tool_use → end_turn 两个超阈值轮次 → 只压缩一次（防抖）。"""
     session = await repo.create_session(model="claude-opus-4-8", effort="high")
     llm = ScriptedLLM([
         LLMTurnResult(
@@ -189,7 +166,7 @@ async def test_compaction_once_per_run(
         LLMTurnResult(
             content=[{"type": "text", "text": "done"}],
             stop_reason="end_turn",
-            usage=big_usage(400),  # 压缩后仍超阈值 → 不再触发
+            usage=big_usage(400),
         ),
     ])
     client = MockCompactClient(COMPACTION_CONTENT)
@@ -202,7 +179,6 @@ async def test_compaction_once_per_run(
 async def test_compaction_failure_degrades_loop(
     repo: Repository, registry: ToolRegistry
 ) -> None:
-    """compact 抛错 → warning 降级，主循环照常完成（不阻塞、不丢结果）。"""
 
     class ExplodingCompactor:
         async def compact(self, **kwargs: Any) -> Any:
@@ -236,7 +212,6 @@ async def test_compaction_failure_degrades_loop(
 async def test_no_compactor_keeps_baseline_behavior(
     repo: Repository, registry: ToolRegistry
 ) -> None:
-    """未注入 compactor（默认）→ 超阈值也不压缩（历史基线行为不变）。"""
     session = await repo.create_session(model="claude-opus-4-8", effort="high")
     llm = ScriptedLLM([
         LLMTurnResult(
@@ -249,21 +224,12 @@ async def test_no_compactor_keeps_baseline_behavior(
     outcome = await loop.run(session.id, "hello")
     assert outcome.ok is True
     messages = await repo.get_messages(session.id)
-    # 只有 user + assistant 两条，无 compaction 插入
     assert len(messages) == 2
-
-
-# ----------------------------------------------------------------------
-# 联动：turn_complete.cost_usd 真实值 + session 累计通道
-# ----------------------------------------------------------------------
 
 
 async def test_turn_complete_carries_real_cost_and_session_accumulates(
     repo: Repository, registry: ToolRegistry
 ) -> None:
-    """cost = (input*5 + output*25)/1e6：
-    轮1 (1000,100) → 0.0075；轮2 (2000,100) → 0.0125；run 合计 0.02。
-    经 update_session_usage 累加进 sessions 表。"""
     session = await repo.create_session(model="claude-opus-4-8", effort="high")
     llm = ScriptedLLM([
         LLMTurnResult(
@@ -289,12 +255,10 @@ async def test_turn_complete_carries_real_cost_and_session_accumulates(
     loop._event_sink = sink
     outcome = await loop.run(session.id, "hello")
 
-    # turn_complete 事件（每 run 一条）
     completes = [e for e in events if e.type is SSEEventType.TURN_COMPLETE]
     assert len(completes) == 1
     assert completes[0].data["cost_usd"] == pytest.approx(0.0075 + 0.0125)
 
-    # run outcome 与 session 累计通道一致
     assert outcome.cost_usd == pytest.approx(0.02)
     updated = await repo.get_session(session.id)
     assert updated.total_cost_usd == pytest.approx(0.02)

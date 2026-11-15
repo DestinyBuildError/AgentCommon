@@ -1,10 +1,3 @@
-"""AgentLoop 状态机集成测试 —— 全部 mock LLM，绝不发起真实 API 调用。
-
-覆盖：两轮对话（tool_use → end_turn）全链路（消息持久化 / tool_call 落表 /
-SSE 事件序列）、max_iterations 终止、refusal 终态不重试、max_tokens 快照回滚、
-pause_turn 续传、fatal LLM 错误终止、执行中断合成 interrupted 结果、
-审批流经 loop 发 approval_request。
-"""
 
 from __future__ import annotations
 
@@ -26,11 +19,6 @@ from app.db.models import Base
 from app.db.repository import Repository
 from app.schemas.events import SSEEvent, SSEEventType
 from app.tools.registry import ToolRegistry, ToolSpec
-
-
-# ----------------------------------------------------------------------
-# 夹具：内存库 + Registry + Scripted LLM
-# ----------------------------------------------------------------------
 
 
 @pytest.fixture
@@ -84,14 +72,13 @@ def registry() -> ToolRegistry:
             handler=risky,
             timeout_s=5,
             dangerous=True,
-            access="execute",  # 审批门由权限矩阵按 access 判定
+            access="execute",
         )
     )
     return registry
 
 
 class ScriptedLLM:
-    """脚本化 mock LLM：按序回放 turns；每轮可附 deltas；异常实例直接抛出。"""
 
     def __init__(self, turns: list[Any], deltas: list[list[StreamDelta]] | None = None) -> None:
         self.turns = list(turns)
@@ -183,11 +170,6 @@ def text_delta(text: str) -> StreamDelta:
     return StreamDelta(kind="text", text=text)
 
 
-# ----------------------------------------------------------------------
-# 核心链路：两轮对话（tool_use → end_turn）
-# ----------------------------------------------------------------------
-
-
 async def test_two_turn_tool_use_flow(repo: Repository, registry: ToolRegistry) -> None:
     session = await repo.create_session(model="claude-opus-4-8", effort="high")
     llm = ScriptedLLM(
@@ -202,13 +184,11 @@ async def test_two_turn_tool_use_flow(repo: Repository, registry: ToolRegistry) 
     loop = build_loop(repo, registry, llm, event_sink=sink)
     outcome = await loop.run(session.id, "hello world")
 
-    # ---- outcome ----
     assert outcome.ok is True
     assert outcome.stop_reason == "end_turn"
     assert outcome.iterations == 2
     assert outcome.usage == UsageData(input_tokens=250, output_tokens=30, cache_read=230)
 
-    # ---- 消息序列正确持久化（append-only，无孤儿）----
     messages = await repo.get_messages(session.id)
     assert [m.role for m in messages] == ["user", "assistant", "user", "assistant"]
     assert messages[0].content == [{"type": "text", "text": "hello world"}]
@@ -228,7 +208,6 @@ async def test_two_turn_tool_use_flow(repo: Repository, registry: ToolRegistry) 
 
     assert needs_repair([{"role": m.role, "content": m.content} for m in messages]) is False
 
-    # ---- tool_call 记录落表 ----
     calls = await repo.list_tool_calls(session.id)
     assert len(calls) == 1
     call = calls[0]
@@ -240,7 +219,6 @@ async def test_two_turn_tool_use_flow(repo: Repository, registry: ToolRegistry) 
     assert call.approval == "auto"
     assert "echoed" in str(call.result)
 
-    # ---- SSE 事件序列 ----
     assert [e.type for e in events] == [
         SSEEventType.TEXT_DELTA,
         SSEEventType.TOOL_CALL_START,
@@ -248,7 +226,7 @@ async def test_two_turn_tool_use_flow(repo: Repository, registry: ToolRegistry) 
         SSEEventType.TEXT_DELTA,
         SSEEventType.TURN_COMPLETE,
     ]
-    assert [e.seq for e in events] == [1, 2, 3, 4, 5]  # 会话内单调递增
+    assert [e.seq for e in events] == [1, 2, 3, 4, 5]
     start = events[1].data
     assert start["tool_use_id"] == "tu_1" and start["name"] == "echo"
     assert "text" in start["input_preview"]
@@ -263,14 +241,12 @@ async def test_two_turn_tool_use_flow(repo: Repository, registry: ToolRegistry) 
         "cache_creation": 0,
     }
 
-    # ---- LLM 收到的消息序列：第二轮带上了 tool_result ----
     assert len(llm.calls[0]["messages"]) == 1
     assert llm.calls[0]["messages"][0]["role"] == "user"
     second = llm.calls[1]["messages"]
     assert [m["role"] for m in second] == ["user", "assistant", "user"]
     assert second[-1]["content"][0]["type"] == "tool_result"
 
-    # ---- 会话状态与用量 ----
     refreshed = await repo.get_session(session.id)
     assert refreshed.status == "idle"
     assert refreshed.total_input_tokens == 250
@@ -291,18 +267,13 @@ async def test_event_seq_continues_across_runs(repo: Repository, registry: ToolR
     loop = build_loop(repo, registry, llm, event_sink=sink)
     await loop.run(session.id, "first")
     await loop.run(session.id, "second")
-    assert [e.seq for e in events] == [1, 2, 3, 4]  # 同一 loop 实例跨 run 连续编号
+    assert [e.seq for e in events] == [1, 2, 3, 4]
 
 
 async def test_session_not_found_raises(repo: Repository, registry: ToolRegistry) -> None:
     loop = build_loop(repo, registry, ScriptedLLM([]))
     with pytest.raises(SessionNotFoundError):
         await loop.run("no-such-session", "hi")
-
-
-# ----------------------------------------------------------------------
-# 终态分支
-# ----------------------------------------------------------------------
 
 
 async def test_refusal_is_terminal_no_retry(repo: Repository, registry: ToolRegistry) -> None:
@@ -325,7 +296,7 @@ async def test_refusal_is_terminal_no_retry(repo: Repository, registry: ToolRegi
     outcome = await loop.run(session.id, "do something bad")
 
     assert outcome.stop_reason == "refusal"
-    assert len(llm.calls) == 1  # 终态：不重试
+    assert len(llm.calls) == 1
     messages = await repo.get_messages(session.id)
     assert [m.role for m in messages] == ["user", "assistant"]
     assert messages[1].stop_reason == "refusal"
@@ -355,10 +326,9 @@ async def test_max_iterations_terminates_loop(repo: Repository, registry: ToolRe
     assert outcome.ok is False
     assert outcome.stop_reason == "max_iterations"
     assert outcome.iterations == 3
-    assert len(llm.calls) == 3  # 全局保护：恰好停在第 3 轮
+    assert len(llm.calls) == 3
 
     messages = await repo.get_messages(session.id)
-    # user + 3×(assistant tool_use + user tool_result)，全部配对无孤儿
     assert len(messages) == 7
     assert needs_repair([{"role": m.role, "content": m.content} for m in messages]) is False
 
@@ -371,12 +341,11 @@ async def test_max_iterations_terminates_loop(repo: Repository, registry: ToolRe
 async def test_max_tokens_rolls_back_snapshot_and_retries(
     repo: Repository, registry: ToolRegistry
 ) -> None:
-    """不变量 2：半截 assistant 不落库，内存快照回滚后加大 max_tokens 重试。"""
     session = await repo.create_session(model="m", effort="high")
     truncated = LLMTurnResult(
         content=[
             {"type": "text", "text": "half wri"},
-            {"type": "tool_use", "id": "tu_cut", "name": "echo", "input": {"text": "cu"}},  # 截断的半截
+            {"type": "tool_use", "id": "tu_cut", "name": "echo", "input": {"text": "cu"}},
         ],
         stop_reason="max_tokens",
         usage=UsageData(10, 100),
@@ -387,18 +356,14 @@ async def test_max_tokens_rolls_back_snapshot_and_retries(
 
     assert outcome.ok is True
     assert outcome.stop_reason == "end_turn"
-    # 第一次 1000，回滚重试时翻倍到 2000
     assert llm.calls[0]["max_tokens"] == 1000
     assert llm.calls[1]["max_tokens"] == 2000
-    # 第二次请求不含半截 assistant 消息（快照回滚）
     assert len(llm.calls[1]["messages"]) == 1
 
-    # 半截消息永不持久化：DB 只有 user + 最终 assistant
     messages = await repo.get_messages(session.id)
     assert [m.role for m in messages] == ["user", "assistant"]
     assert messages[1].content[0]["text"] == "complete answer"
     assert needs_repair([{"role": m.role, "content": m.content} for m in messages]) is False
-    # 截断轮的 token 已真实消耗 → 仍计入 sessions 用量
     refreshed = await repo.get_session(session.id)
     assert refreshed.total_input_tokens == 22
     assert refreshed.total_output_tokens == 150
@@ -421,14 +386,12 @@ async def test_pause_turn_continues_conversation(
     messages = await repo.get_messages(session.id)
     assert [m.role for m in messages] == ["user", "assistant", "assistant"]
     assert messages[1].stop_reason == "pause_turn"
-    # 续传：pause 轮 assistant 已在第二次请求的消息序列里（保持 user/assistant 交替）
     second = llm.calls[1]["messages"]
     assert [m["role"] for m in second] == ["user", "assistant"]
     assert second[1]["content"][0]["text"] == "long search part 1"
 
 
 def test_merge_consecutive_same_role_messages() -> None:
-    """repair 插入 / pause_turn 后可能出现同角色相邻消息 → 发送前合并。"""
     history = [
         {"role": "user", "content": [{"type": "text", "text": "q"}]},
         {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t"}]},
@@ -439,7 +402,6 @@ def test_merge_consecutive_same_role_messages() -> None:
     assert [m["role"] for m in merged] == ["user", "assistant"]
     assert len(merged[0]["content"]) == 2
     assert len(merged[1]["content"]) == 2
-    # 不修改入参（append-only 友好）
     assert len(history) == 4
 
 
@@ -459,11 +421,10 @@ async def test_fatal_llm_error_terminates_without_retry(
     assert outcome.ok is False
     assert outcome.stop_reason == "error"
     assert outcome.error_code == "auth_error"
-    assert len(llm.calls) == 1  # fatal 不重试
+    assert len(llm.calls) == 1
     error_events = [e for e in events if e.type == SSEEventType.ERROR]
     assert len(error_events) == 1
     assert error_events[0].data == {"code": "auth_error", "message": "invalid x-api-key"}
-    # 没有任何 assistant 消息被持久化（LLM 没产出内容）
     messages = await repo.get_messages(session.id)
     assert [m.role for m in messages] == ["user"]
     refreshed = await repo.get_session(session.id)
@@ -471,7 +432,6 @@ async def test_fatal_llm_error_terminates_without_retry(
 
 
 async def test_generic_llm_error_normalized(repo: Repository, registry: ToolRegistry) -> None:
-    """SDK 重试耗尽后的 429/5xx/连接错误：归一化为 error 事件，循环终止。"""
     session = await repo.create_session(model="m", effort="high")
     llm = ScriptedLLM(turns=[RuntimeError("connection reset")])
     events: list[SSEEvent] = []
@@ -485,13 +445,7 @@ async def test_generic_llm_error_normalized(repo: Repository, registry: ToolRegi
     assert any(e.type == SSEEventType.ERROR and e.data["code"] == "llm_error" for e in events)
 
 
-# ----------------------------------------------------------------------
-# 中断与审批
-# ----------------------------------------------------------------------
-
-
 class CancelledDispatcher:
-    """模拟执行工具时被用户打断。"""
 
     def __init__(self) -> None:
         self.notifier = None
@@ -519,7 +473,6 @@ async def test_interrupted_tool_execution_synthesizes_interrupted_results(
     with pytest.raises(asyncio.CancelledError):
         await loop.run(session.id, "go")
 
-    # assistant 已持久化 + 全部 tool_use 合成 interrupted 结果（不变量 1）
     messages = await repo.get_messages(session.id)
     assert [m.role for m in messages] == ["user", "assistant", "user"]
     block = messages[2].content[0]
@@ -562,7 +515,7 @@ async def test_approval_flow_emits_approval_request(
     types = [e.type for e in events]
     assert types == [
         SSEEventType.TOOL_CALL_START,
-        SSEEventType.APPROVAL_REQUEST,  # dangerous 工具 → 审批请求事件
+        SSEEventType.APPROVAL_REQUEST,
         SSEEventType.TOOL_CALL_RESULT,
         SSEEventType.TURN_COMPLETE,
     ]
@@ -576,7 +529,6 @@ async def test_approval_flow_emits_approval_request(
 
 
 async def test_usage_and_ledger_consistency(repo: Repository, registry: ToolRegistry) -> None:
-    """每轮 usage 增量累加进 sessions 表；loop 内部 ledger 与之和一致。"""
     session = await repo.create_session(model="m", effort="high")
     llm = ScriptedLLM(
         turns=[
@@ -591,5 +543,4 @@ async def test_usage_and_ledger_consistency(repo: Repository, registry: ToolRegi
     assert refreshed.total_input_tokens == outcome.usage.input_tokens == 75
     assert refreshed.total_output_tokens == outcome.usage.output_tokens == 14
     assert refreshed.cache_read_tokens == outcome.usage.cache_read == 65
-    # TokenLedger 阈值判断在 loop 内已被消费（本例远低于 150K）
     assert TokenLedger().should_compact() is False

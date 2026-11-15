@@ -1,65 +1,67 @@
-# LLM Agent 后端配置示例 —— 复制为 config.yaml 后按需修改。
-# 敏感字段（anthropic_api_key）只应通过环境变量 ANTHROPIC_API_KEY 提供，
-# 不要把真实密钥写进本文件或提交到仓库。
-# 环境变量优先级高于本文件。
+# AgentCommon backend configuration template.
+# Copy this file to config.yaml and adjust as needed.
+# Secrets (the LLM API key) must be provided via the ANTHROPIC_API_KEY
+# environment variable, never committed to the repository.
+# Environment variables take precedence over this file.
 
-# ---- 模型（ARCHITECTURE.md §1.3 / §九-2）----
+# ---- Model ----
 model: claude-opus-4-8
-effort: high                 # low / medium / high，控制成本与质量
+effort: high                 # low / medium / high - controls cost vs quality
 max_tokens: 16000
 
-# ---- Agent 引擎安全阀（§4.3）----
-tool_breaker_limit: 3        # 同一工具连续失败 N 次后熔断
-max_iterations: 30           # 单轮 agent loop 最大迭代次数
-approval_timeout_s: 120      # 审批弹窗超时自动 deny
-session_idle_timeout_s: 600  # 会话空闲 10 分钟后回收 loop 任务
+# ---- Agent engine safety limits ----
+tool_breaker_limit: 3        # circuit-break a tool after N consecutive failures
+max_iterations: 30           # max agent-loop iterations per turn
+approval_timeout_s: 120      # auto-deny pending approvals after this timeout
+session_idle_timeout_s: 600  # recycle idle session loop tasks after 10 minutes
 
-# ---- 任务拆解规划器（任务 #12：后端思考增强）----
-# medium/complex 任务先发 task_options 事件让用户选执行方向；超时自动采用
-# 推荐方案并继续。false → 消息直接进 agent loop，规划器完全不参与
+# ---- Task planner ----
+# For medium/complex tasks the planner first emits a task_options event with
+# candidate execution plans; on timeout it auto-selects the recommended one.
+# false -> messages go straight into the agent loop, planner disabled.
 planner_enabled: true
-planner_max_options: 4       # 选项数上限（2~4）
-planner_timeout_s: 120       # 用户选择超时（秒）
-# 长时任务进度推送（任务 #12b）：后端扫描定义长时任务（规划器标记或运行
-# 超阈值自动升级），此后每 progress_interval_s 秒推送一次 task_progress
+planner_max_options: 4       # max options per plan (2~4)
+planner_timeout_s: 120       # user choice timeout (seconds)
+# Long-task progress push: once a task is flagged long-running (past
+# long_running_after_s), task_progress events are emitted every interval.
 progress_interval_s: 60
 long_running_after_s: 90
 
-# ---- 存储（§五）----
-# 开发用 SQLite；生产切 PostgreSQL（如 postgresql+asyncpg://user:pass@host/db）
+# ---- Storage ----
+# SQLite for development; switch to PostgreSQL in production
+# (e.g. postgresql+asyncpg://user:pass@host/db)
 database_url: sqlite+aiosqlite:///./data/agent.db
 
-# ---- 工作区（任务 #8 多目录工作区）----
-# workspace_root 仅为首次播种种子：workspace_dirs 表为空时作为第一个工作区
-# 目录（source=user）；运行期目录经 /api/workspaces 端点或 agent 工具
-# （add_workspace_dir / remove_workspace_dir）动态增删，改完即生效不重启。
-# 可用绝对路径（如 D:\资料）或相对路径（相对后端进程 CWD）。
+# ---- Workspaces ----
+# workspace_root is only the initial seed: when the workspace_dirs table is
+# empty it becomes the first workspace directory (source=user). Directories
+# are managed at runtime via the /api/workspaces endpoints or agent tools
+# (add_workspace_dir / remove_workspace_dir); changes take effect immediately.
+# Paths may be absolute (e.g. D:\data) or relative to the backend CWD.
 workspace_root: ../workspace
-agent_manage_dirs: true       # false → 禁止 agent 自主增删工作区目录（工具 is_error）
+agent_manage_dirs: true      # false -> agent may not add/remove workspace dirs
 
-# ---- MCP 接入（§4.5，P4-A）----
-# 每项：name + （command/args → stdio 子进程）或（url → streamable http）。
-# 工具注册进全局注册表，命名空间前缀 mcp__<server>__<tool>。
-# 启动失败降级不阻塞：单 server 起不来只跳过 + warning，其余继续。
-# 预置 demo server（backend/demo_mcp_server.py，工具 current_time / echo_text），
-# 开箱即可演示 MCP 全链路——问模型"现在几点"即可看到 mcp__demo__current_time。
+# ---- MCP integration ----
+# Each entry: name + (command/args -> stdio subprocess) or (url -> streamable
+# http). Tools register under the mcp__<server>__<tool> namespace prefix.
+# Startup failure degrades gracefully: a single broken server is skipped with
+# a warning and the rest keep working.
+# The bundled demo server (demo_mcp_server.py, tools current_time / echo_text)
+# works out of the box - ask the model "what time is it" to see the full
+# MCP pipeline in action.
 mcp_servers:
   - name: demo
-    command: "python"            # 裸 python 别名会解析为后端 venv 的解释器；
-    args: ["demo_mcp_server.py"] # 也可显式写绝对路径，如 .venv/Scripts/python.exe
+    command: "python"            # bare python resolves to the backend venv
+    args: ["demo_mcp_server.py"] # or use an absolute interpreter path
   # - name: search
   #   url: "http://127.0.0.1:8080/mcp"
-  #   enabled: false              # 单 server 级开关
+  #   enabled: false              # per-server switch
 
-# ---- 自扩展 Agent（任务 #11：发现/安装 MCP server + Python 沙箱兜底）----
-# 元工具：discover_tools / install_mcp_server / uninstall_mcp_server / run_python。
-# install/uninstall/run_python 为 dangerous=true，执行前过 H5 审批门
-# （防提示注入诱导安装恶意工具/执行任意代码）。
-enable_tool_discovery: true  # false → 四个元工具执行时统一 is_error
-# 精选工具目录（discover_tools 的搜索空间）；预置 3 个本地 demo server
-# （backend/catalog_servers/）：text_tools / unit_convert / password_gen
-tool_catalog_path: tool_catalog.yaml
-run_python_max_timeout_s: 120  # run_python 超时硬上限（秒），模型传更大值会被钳制
-
-# ---- 密钥 ----
-# anthropic_api_key: 留空，运行时从环境变量 ANTHROPIC_API_KEY 读取
+# ---- Self-extending agent ----
+# Meta tools: discover_tools / install_mcp_server / uninstall_mcp_server /
+# run_python. install/uninstall/run_python are dangerous=true and go through
+# the approval gate before executing (guards against prompt-injection
+# attempts to install malicious tools or run arbitrary code).
+enable_tool_discovery: true  # false -> all four meta tools return is_error
+tool_catalog_path: tool_catalog.yaml  # curated catalog searched by discover_tools
+run_python_max_timeout_s: 120  # hard cap for run_python; larger values are clamped

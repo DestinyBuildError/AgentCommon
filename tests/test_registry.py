@@ -1,9 +1,3 @@
-"""工具注册表 + 本地工具测试。
-
-覆盖：注册/列举/获取、排序确定性（缓存纪律）、api_schema 形态、
-read_file 路径穿越防护（workspace 外文件被拒）、search_workspace 关键词
-grep、calculate ast 安全求值。
-"""
 
 from __future__ import annotations
 
@@ -31,11 +25,6 @@ def make_spec(name: str, **overrides) -> ToolSpec:
     return ToolSpec(**defaults)
 
 
-# ----------------------------------------------------------------------
-# 注册表：注册 / 列举 / 排序确定性
-# ----------------------------------------------------------------------
-
-
 def test_register_list_get() -> None:
     registry = ToolRegistry()
     spec_b = make_spec("beta")
@@ -46,12 +35,11 @@ def test_register_list_get() -> None:
     assert len(registry) == 2
     assert registry.get("alpha") is spec_a
     assert registry.get("missing") is None
-    assert [s.name for s in registry.list()] == ["alpha", "beta"]  # 按名排序
+    assert [s.name for s in registry.list()] == ["alpha", "beta"]
     assert registry.names() == ["alpha", "beta"]
 
 
 def test_list_order_is_deterministic_regardless_of_registration_order() -> None:
-    """缓存纪律：工具列表顺序确定 → prompt caching 前缀稳定。"""
     names = ["zeta", "alpha", "mango", "beta", "kiwi"]
     r1, r2 = ToolRegistry(), ToolRegistry()
     for n in names:
@@ -88,8 +76,6 @@ def test_duplicate_registration_rejected() -> None:
 
 
 def test_default_tools_are_safe_marks() -> None:
-    """只读工具 dangerous=False、parallel_safe=True；写/执行工具带
-    dangerous 语义标记与 access 类别（权限矩阵判据）。"""
     registry = ToolRegistry()
     register_default_tools(registry, workspace_root=".")
     assert registry.names() == [
@@ -111,18 +97,13 @@ def test_default_tools_are_safe_marks() -> None:
     assert registry.get("run_command").access == "execute"
 
 
-# ----------------------------------------------------------------------
-# read_file：workspace 沙箱 + 路径穿越防护
-# ----------------------------------------------------------------------
-
-
 @pytest.fixture
 def workspace(tmp_path: Path) -> Path:
     root = tmp_path / "ws"
     (root / "sub").mkdir(parents=True)
     (root / "notes.txt").write_text("hello workspace", encoding="utf-8")
     (root / "sub" / "code.py").write_text("print('hi')", encoding="utf-8")
-    (tmp_path / "secret.txt").write_text("TOP SECRET", encoding="utf-8")  # workspace 外
+    (tmp_path / "secret.txt").write_text("TOP SECRET", encoding="utf-8")
     return root
 
 
@@ -173,7 +154,6 @@ def test_read_file_rejects_deep_traversal_via_subdir(workspace: Path) -> None:
 
 
 def test_read_file_not_found_hint_lists_directory(workspace: Path) -> None:
-    """例：文件不存在附带目录线索。"""
     registry = ToolRegistry()
     register_default_tools(registry, workspace)
 
@@ -188,11 +168,6 @@ def test_read_file_validates_input(workspace: Path) -> None:
     register_default_tools(registry, workspace)
     with pytest.raises(ToolInputError):
         tool_handler(registry, "read_file", {})
-
-
-# ----------------------------------------------------------------------
-# search_workspace：目录内关键词 grep
-# ----------------------------------------------------------------------
 
 
 def test_search_workspace_finds_keyword(workspace: Path) -> None:
@@ -225,11 +200,6 @@ def test_search_workspace_empty_pattern_invalid(workspace: Path) -> None:
     register_default_tools(registry, workspace)
     with pytest.raises(ToolInputError):
         tool_handler(registry, "search_workspace", {"pattern": ""})
-
-
-# ----------------------------------------------------------------------
-# calculate：ast 安全求值
-# ----------------------------------------------------------------------
 
 
 def test_calculate_arithmetic() -> None:

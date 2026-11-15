@@ -1,4 +1,3 @@
-"""审批回调路由（契约）：POST /sessions/{id}/approvals/{tool_use_id}。"""
 
 from __future__ import annotations
 
@@ -22,7 +21,6 @@ async def resolve_approval(
     db: AsyncSession = Depends(get_db),
     manager: SessionManager = Depends(get_session_manager),
 ) -> dict:
-    """提交审批结果。无此 pending 审批（已决议 / 超时 / 会话不在跑）→ 404。"""
     session = await Repository(db).get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session not found: {session_id}")

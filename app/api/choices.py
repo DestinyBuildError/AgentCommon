@@ -1,9 +1,3 @@
-"""任务拆解选择回调路由：POST /sessions/{id}/choices/{choice_id}。
-
-与 approvals.py 同构的薄协议转换：校验会话存在 → manager.resolve_choice
-设置 PendingChoice Future → AgentLoop 注入选择注记后继续循环。
-无此 pending（已超时自动采用 / 会话不在跑）→ 404。
-"""
 
 from __future__ import annotations
 
@@ -27,7 +21,6 @@ async def resolve_choice(
     db: AsyncSession = Depends(get_db),
     manager: SessionManager = Depends(get_session_manager),
 ) -> dict:
-    """提交任务拆解选择。无此 pending 选择（已超时/已决议）→ 404。"""
     session = await Repository(db).get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session not found: {session_id}")

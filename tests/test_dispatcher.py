@@ -1,9 +1,3 @@
-"""ToolDispatcher 单元测试。
-
-覆盖：成功路径、参数错误归一化、超时归一化、未知工具、永久失败附 hint、
-内部重试（默认 0 次 / 瞬时重试后成功 / 耗尽）、熔断触发与解除、
-并行隔离（一个失败不影响其他）、审批拒绝/放行/自动放行、审批通知钩子。
-"""
 
 from __future__ import annotations
 
@@ -36,11 +30,9 @@ def spec(
     access: str | None = None,
 ) -> ToolSpec:
     if handler is None:
-        async def handler(tool_input: dict) -> dict:  # type: ignore[misc]
+        async def handler(tool_input: dict) -> dict:
             return {"echo": tool_input}
 
-    # 后审批门由 access 矩阵驱动：dangerous=True 的旧测试语义
-    # （"需审批"）对应 execute 类（read 模式下审批）；不传 access 时按此推导
     if access is None:
         access = "execute" if dangerous else "read"
 
@@ -60,11 +52,6 @@ def spec(
 
 def error_payload(result: Any) -> dict:
     return json.loads(result.content)
-
-
-# ----------------------------------------------------------------------
-# 基本路径
-# ----------------------------------------------------------------------
 
 
 async def test_success_path() -> None:
@@ -98,20 +85,15 @@ async def test_unknown_tool_lists_available() -> None:
     assert "real_tool" in payload["error"]["hint"]
 
 
-# ----------------------------------------------------------------------
-# 失败归一化 1：参数不合法
-# ----------------------------------------------------------------------
-
-
 async def test_missing_required_field_is_invalid_params() -> None:
     handler = AsyncMock(return_value={"ok": True})
     dispatcher = ToolDispatcher(make_registry([spec(handler=handler)]))
-    result = await dispatcher.dispatch("echo", {}, "tu_1")  # 缺 required q
+    result = await dispatcher.dispatch("echo", {}, "tu_1")
 
     assert result.is_error is True
     assert result.code == "invalid_params"
     assert "q" in result.content
-    handler.assert_not_awaited()  # 参数非法不执行
+    handler.assert_not_awaited()
 
 
 async def test_wrong_field_type_is_invalid_params() -> None:
@@ -132,11 +114,6 @@ async def test_tool_raised_input_error_normalized() -> None:
     assert error_payload(result)["error"]["hint"] == "fix it"
 
 
-# ----------------------------------------------------------------------
-# 失败归一化 5：超时
-# ----------------------------------------------------------------------
-
-
 async def test_timeout_normalized() -> None:
     async def slow(tool_input: dict) -> Any:
         await asyncio.sleep(5)
@@ -148,11 +125,6 @@ async def test_timeout_normalized() -> None:
     assert result.code == "timeout"
     assert result.status == "timeout"
     assert "timed out after 0.05s" in result.content
-
-
-# ----------------------------------------------------------------------
-# 失败归一化 3/4：瞬时重试、永久失败
-# ----------------------------------------------------------------------
 
 
 async def test_permanent_error_returns_immediately_with_hint() -> None:
@@ -176,7 +148,7 @@ async def test_transient_error_default_zero_retries() -> None:
         make_registry([spec(handler=flaky)]), retry_backoff_base_s=0
     )
     result = await dispatcher.dispatch("echo", {"q": "x"}, "tu_1")
-    assert calls["n"] == 1  # 默认 retryable=0：不内部重试
+    assert calls["n"] == 1
     assert result.code == "transient_failure"
 
 
@@ -215,11 +187,6 @@ def test_tool_error_json_shape() -> None:
     assert json.loads(tool_error("c", "m")) == {"error": {"type": "c", "message": "m"}}
 
 
-# ----------------------------------------------------------------------
-# 熔断器
-# ----------------------------------------------------------------------
-
-
 async def test_breaker_trips_after_consecutive_failures() -> None:
     calls = {"n": 0}
 
@@ -233,9 +200,8 @@ async def test_breaker_trips_after_consecutive_failures() -> None:
         assert result.code == "service_down"
     assert calls["n"] == 3
 
-    # 第 4 次：熔断触发 → 直接拒绝，不再执行 handler
     tripped = await dispatcher.dispatch("echo", {"q": "x"})
-    assert calls["n"] == 3  # handler 未被再次调用
+    assert calls["n"] == 3
     assert tripped.code == "breaker_tripped"
     assert "Stop retrying this tool" in error_payload(tripped)["error"]["hint"]
 
@@ -250,22 +216,19 @@ async def test_breaker_success_resets_consecutive_count() -> None:
 
     dispatcher = ToolDispatcher(make_registry([spec(handler=flaky)]))
 
-    # 失败两次（连续计数 = 2，未到熔断阈值 3）
     mode["fail"] = True
     for _ in range(2):
         r = await dispatcher.dispatch("echo", {"q": "x"})
         assert r.code == "down"
 
-    # 成功一次 → 连续计数清零
     mode["fail"] = False
     ok = await dispatcher.dispatch("echo", {"q": "x"})
     assert ok.ok is True
 
-    # 再连续失败 2 次（< 3）也不会熔断，handler 仍被真正执行
     mode["fail"] = True
     r1 = await dispatcher.dispatch("echo", {"q": "x"})
     r2 = await dispatcher.dispatch("echo", {"q": "x"})
-    assert r1.code == "down" and r2.code == "down"  # 仍是失败，但不是 breaker_tripped
+    assert r1.code == "down" and r2.code == "down"
 
 
 async def test_breaker_reset_reenables_tool() -> None:
@@ -279,7 +242,7 @@ async def test_breaker_reset_reenables_tool() -> None:
 
     dispatcher.reset_breaker("echo")
     result = await dispatcher.dispatch("echo", {"q": "x"})
-    assert result.code == "down"  # 恢复执行（工具本身仍失败，但不再是熔断错误）
+    assert result.code == "down"
 
 
 async def test_denied_and_unknown_do_not_count_toward_breaker() -> None:
@@ -292,15 +255,9 @@ async def test_denied_and_unknown_do_not_count_toward_breaker() -> None:
     )
     for _ in range(5):
         result = await dispatcher.dispatch("risky", {"q": "x"})
-        assert result.code == "approval_denied"  # 不是 breaker_tripped
-    # 换正常工具不受影响；被拒工具下次（若放行）仍可执行
+        assert result.code == "approval_denied"
     result = await dispatcher.dispatch("unknown_xyz", {})
     assert result.code == "unknown_tool"
-
-
-# ----------------------------------------------------------------------
-# 并行隔离
-# ----------------------------------------------------------------------
 
 
 async def test_parallel_isolation_one_failure_does_not_affect_others() -> None:
@@ -323,10 +280,10 @@ async def test_parallel_isolation_one_failure_does_not_affect_others() -> None:
     ])
 
     assert len(results) == 3
-    assert results[0].ok is True  # 失败不影响其他
+    assert results[0].ok is True
     assert results[1].is_error is True and results[1].code == "internal_error"
     assert results[2].ok is True
-    assert [r.tool_use_id for r in results] == ["tu_1", "tu_2", "tu_3"]  # 顺序保持
+    assert [r.tool_use_id for r in results] == ["tu_1", "tu_2", "tu_3"]
 
 
 async def test_dispatch_many_empty() -> None:
@@ -352,12 +309,7 @@ async def test_non_parallel_safe_tools_serialize() -> None:
         ("t2", "lonely", {"q": "b"}),
     ])
     assert all(r.ok for r in results)
-    assert order == ["a", "b"]  # 严格串行
-
-
-# ----------------------------------------------------------------------
-# 审批门
-# ----------------------------------------------------------------------
+    assert order == ["a", "b"]
 
 
 async def test_approval_denied_returns_do_not_retry_message() -> None:
@@ -370,7 +322,7 @@ async def test_approval_denied_returns_do_not_retry_message() -> None:
     result = await dispatcher.dispatch("risky", {"q": "x"}, "tu_9")
 
     approve.assert_awaited_once_with("risky", {"q": "x"})
-    handler.assert_not_awaited()  # 拒绝后不执行
+    handler.assert_not_awaited()
     assert result.is_error is True
     assert result.status == "denied"
     assert result.approval == "denied"
@@ -405,9 +357,9 @@ async def test_dangerous_tool_without_callback_auto_allows() -> None:
 
 async def test_non_dangerous_tool_skips_approval_callback() -> None:
     handler = AsyncMock(return_value={"done": 1})
-    approve = AsyncMock(return_value=False)  # 即便回调总拒绝
+    approve = AsyncMock(return_value=False)
     dispatcher = ToolDispatcher(
-        make_registry([spec(name="safe", handler=handler)]),  # dangerous=False
+        make_registry([spec(name="safe", handler=handler)]),
         approve_callback=approve,
     )
     result = await dispatcher.dispatch("safe", {"q": "x"})

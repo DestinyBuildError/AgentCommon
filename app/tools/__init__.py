@@ -1,4 +1,3 @@
-"""工具层：注册表 + 本地工具实现（tools/、调度策略标记）。"""
 
 from app.tools.errors import (
     ToolError,

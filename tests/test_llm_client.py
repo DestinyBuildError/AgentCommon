@@ -1,9 +1,3 @@
-"""LLMClient 单元测试 —— 全部 mock，绝不发起真实 API 调用。
-
-覆盖：流式 delta 回调 + usage 提取、system blocks + cache_control、
-thinking adaptive 参数、SDK 类型化异常分类（fatal vs 可重试透传）、
-client/client_factory 注入。
-"""
 
 from __future__ import annotations
 
@@ -20,11 +14,6 @@ from app.core.llm_client import (
     UsageData,
     build_system_blocks,
 )
-
-
-# ----------------------------------------------------------------------
-# Fake Anthropic client：messages.stream(**kwargs) → async CM stream
-# ----------------------------------------------------------------------
 
 
 class FakeStream:
@@ -101,9 +90,6 @@ def api_error(cls: type[Exception], status: int) -> Exception:
     return cls("boom", response=httpx.Response(status, request=request), body=None)
 
 
-# ----------------------------------------------------------------------
-
-
 async def test_streaming_deltas_and_usage_extraction() -> None:
     client = LLMClient(
         FakeAnthropic([
@@ -139,14 +125,13 @@ async def test_request_params_model_thinking_system_cache_control_tools() -> Non
         messages=[{"role": "user", "content": []}],
         system="you are an agent",
         tools=[{"name": "t", "description": "d", "input_schema": {"type": "object"}}],
-        max_tokens=99,  # 显式传参优先
+        max_tokens=99,
     )
 
     kwargs = fake.messages.kwargs_history[0]
     assert kwargs["model"] == "claude-opus-4-8"
     assert kwargs["max_tokens"] == 99
     assert kwargs["thinking"] == {"type": "adaptive"}
-    # system 冻结为 blocks，最后一个 block 带 cache_control（缓存纪律）
     assert kwargs["system"] == [
         {
             "type": "text",
@@ -173,11 +158,6 @@ async def test_usage_defaults_when_missing() -> None:
     assert result.usage == UsageData()
 
 
-# ----------------------------------------------------------------------
-# 异常分类（：类型化异常，不做字符串匹配）
-# ----------------------------------------------------------------------
-
-
 @pytest.mark.parametrize(
     ("exc_cls", "status", "expected_code"),
     [
@@ -193,7 +173,6 @@ async def test_fatal_errors_mapped_to_llm_fatal(exc_cls, status, expected_code) 
 
 
 async def test_rate_limit_is_not_fatal_passthrough() -> None:
-    """429 交给 SDK 内置重试；耗尽后类型化异常原样上抛，不包装成 fatal。"""
     client = LLMClient(FakeAnthropic([api_error(RateLimitError, 429)]))
     with pytest.raises(RateLimitError):
         await client.run_turn(messages=[])

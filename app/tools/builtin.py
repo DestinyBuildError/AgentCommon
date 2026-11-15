@@ -1,20 +1,3 @@
-"""本地工具：read_file / search_workspace / calculate + 工作区管理 ×3
-+ write_file / delete_file / run_command（权限控制配套）。
-
-审批门控由 dispatcher 的权限矩阵按 access 类别判定（read 直行；write 类在
-read 权限下审批；run_command/run_python 等 execute 类在 write/full 免批）。
-read_file / search_workspace / write_file / delete_file 被限制在**当前工作区
-目录集合**内，防路径穿越——目录集合经 roots_provider 实时查询（
-provider 模式，增删目录即刻生效，无需重注册）。calculate 用 ast 白名单安全
-解析，绝不 eval() 任意代码。run_command 复用 run_python 的沙箱纪律（环境变量
-白名单、超时钳制、输出截断、Windows 不弹窗）。
-
-工作区管理工具（list_workspace_dirs / add_workspace_dir / remove_workspace_dir）
-由 agent 自主调用（按任务需求由模型决策）；受 settings 开关 agent_manage_dirs
-控制——关闭时执行返回 is_error("workspace management disabled by config")。
-仅在注册时传入 workspace_service（WorkspaceRegistry）时才会注册——没有服务
-的场合（部分单测）不向模型暴露无法执行的工具。
-"""
 
 from __future__ import annotations
 
@@ -38,11 +21,10 @@ from app.core.workspace_registry import (
 from app.tools.errors import ToolInputError, ToolPermanentError
 from app.tools.registry import ToolRegistry, ToolSpec
 
-# ---- read_file / search_workspace 的公共防护参数 ----
 MAX_READ_BYTES = 200_000
-MAX_SEARCH_FILE_BYTES = 1_000_000  # 搜索跳过大文件
-MAX_SEARCH_FILES = 2000  # 扫描文件数上限
-MAX_SEARCH_RESULTS = 200 # 默认命中数上限
+MAX_SEARCH_FILE_BYTES = 1_000_000
+MAX_SEARCH_FILES = 2000
+MAX_SEARCH_RESULTS = 200
 
 _SKIP_DIRS = {
     ".git", ".hg", ".svn", ".venv", "venv", "node_modules", "__pycache__",
@@ -62,16 +44,14 @@ _BIN_OP = {
 _UNARY_OP = {ast.UAdd: operator.pos, ast.USub: operator.neg}
 
 MAX_EXPR_LEN = 1000
-MAX_RESULT_MAGNITUDE = 10 ** 400  # 防 10**100000 之类的结果爆炸
+MAX_RESULT_MAGNITUDE = 10 ** 400
 
-# roots_provider：工具执行时实时取当前工作区目录集合（provider 模式）
 RootsProvider = Callable[[], list[Path]]
 
 MANAGE_DISABLED_MESSAGE = "workspace management disabled by config"
 
 
 def _coerce_roots_provider(workspace_root: str | Path | RootsProvider) -> RootsProvider:
-    """str/Path → 常量 provider；可调用对象原样使用（向后兼容单目录注册）。"""
     if callable(workspace_root):
         return workspace_root
     base = Path(workspace_root)
@@ -79,26 +59,13 @@ def _coerce_roots_provider(workspace_root: str | Path | RootsProvider) -> RootsP
 
 
 def _manage_enabled() -> bool:
-    """settings.agent_manage_dirs 开关（调用时读取——测试可动态切换）。"""
     try:
         return bool(get_settings().agent_manage_dirs)
-    except Exception:  # pragma: no cover - settings 不可用时保守放行只读工具
+    except Exception:
         return True
 
 
-# ----------------------------------------------------------------------
-# read_file / search_workspace：多目录解析 + 防穿越
-# ----------------------------------------------------------------------
-
-
 def _resolve_in_roots(roots_provider: RootsProvider, raw_path: str) -> tuple[Path, Path]:
-    """把用户路径限制在**任一**当前工作区目录内（防路径穿越）。
-
-    绝对路径、含 .. 的相对路径统一 resolve 后逐一与当前目录集合做包含
-    判断，命中第一个包含它的目录；全部不命中即 ToolPermanentError
-    （path_outside_workspace，带目录集合线索，永久失败附建议）。
-    返回 (目标绝对路径, 命中的根目录)。
-    """
     roots = [Path(r).resolve() for r in (roots_provider() or [])]
     candidate = Path(raw_path)
     first_containing: tuple[Path, Path] | None = None
@@ -106,18 +73,14 @@ def _resolve_in_roots(roots_provider: RootsProvider, raw_path: str) -> tuple[Pat
         target = candidate if candidate.is_absolute() else root / candidate
         try:
             resolved = target.resolve()
-        except OSError:  # pragma: no cover - 非法路径字符等，换下一根目录
+        except OSError:
             continue
         if resolved == root or resolved.is_relative_to(root):
-            # 相对名在多根下可能同时几何包含于多个根——**优先返回文件真实
-            # 存在的根**，避免第一个根"遮蔽"后加目录中的同名文件（
-            # 真实模式实测缺陷：treasure.txt 被 root0 遮蔽导致 not_found）
             if first_containing is None:
                 first_containing = (resolved, root)
             if resolved.exists():
                 return resolved, root
     if first_containing is not None:
-        # 无一存在 → 回落第一个几何包含的根（报错 hint 沿用该根的兄弟文件线索）
         return first_containing
     hint = (
         "All file access is confined to workspace roots: "
@@ -162,7 +125,7 @@ def _build_read_file(roots_provider: RootsProvider) -> ToolSpec:
         text = data.decode("utf-8", errors="replace")
         try:
             rel = target.relative_to(root).as_posix()
-        except ValueError:  # target == root（不会发生，前面已挡非文件）
+        except ValueError:
             rel = Path(raw_path).as_posix()
         return {
             "path": rel,
@@ -191,17 +154,7 @@ def _build_read_file(roots_provider: RootsProvider) -> ToolSpec:
     )
 
 
-# ----------------------------------------------------------------------
-# search_workspace
-# ----------------------------------------------------------------------
-
-
 def _iter_workspace_files(root: Path, seen: set[Path], budget: list[int]):
-    """遍历一个 workspace 目录（跳过隐藏/依赖目录与点文件），产出文件路径。
-
-    seen：已产出文件的 resolved 集合（嵌套目录间去重）；budget：跨目录
-    共享的扫描配额（[剩余数]，原地扣减），总数封顶 MAX_SEARCH_FILES。
-    """
     for path in sorted(root.rglob("*")):
         if budget[0] <= 0:
             return
@@ -298,13 +251,7 @@ def _build_search_workspace(roots_provider: RootsProvider) -> ToolSpec:
     )
 
 
-# ----------------------------------------------------------------------
-# calculate
-# ----------------------------------------------------------------------
-
-
 def _safe_eval(node: ast.AST) -> int | float:
-    """ast 白名单求值：仅数字常量与 + - * / // % ** 和一元 +/-。"""
     if isinstance(node, ast.Expression):
         return _safe_eval(node.body)
     if isinstance(node, ast.Constant):
@@ -374,7 +321,6 @@ def _build_calculate() -> ToolSpec:
     )
 
 def _guard_manage_enabled() -> None:
-    """agent_manage_dirs=false 时三个管理工具统一拒绝（is_error 链路）。"""
     if not _manage_enabled():
         raise ToolPermanentError(
             MANAGE_DISABLED_MESSAGE,
@@ -384,7 +330,6 @@ def _guard_manage_enabled() -> None:
 
 
 def _raise_workspace_error(exc: WorkspaceError) -> None:
-    """WorkspaceRegistry 的领域错误 → 工具永久失败（code 原样透传）。"""
     raise ToolPermanentError(str(exc), code=exc.code, hint=exc.hint) from exc
 
 
@@ -439,7 +384,7 @@ def _build_add_workspace_dir(service: WorkspaceRegistry) -> ToolSpec:
         timeout_s=10.0,
         parallel_safe=False,
         dangerous=False,
-        access="write",  # 变更工作区目录集合，read 权限下需审批
+        access="write",
     )
 
 
@@ -475,23 +420,17 @@ def _build_remove_workspace_dir(service: WorkspaceRegistry) -> ToolSpec:
         },
         handler=handler,
         timeout_s=10.0,
-        parallel_safe=False,  # 变更共享目录集合，串行化
+        parallel_safe=False,
         dangerous=False,
         access="write",
     )
 
 
-# ----------------------------------------------------------------------
-# write_file / delete_file（文件写删工具，access=write）
-# ----------------------------------------------------------------------
-
-MAX_WRITE_BYTES = 2_000_000  # 单次写入字节上限（防撑爆磁盘/上下文）
+MAX_WRITE_BYTES = 2_000_000
 _RUN_CMD_DEFAULT_TIMEOUT_S = 30.0
 _RUN_CMD_MAX_OUTPUT_CHARS = 50_000
 _RUN_CMD_GRACE_S = 5.0
 
-# 命令子进程环境变量白名单（与 meta_tools.run_python 同纪律：父进程的
-# 自定义变量——密钥/令牌等——绝不透传给任意命令执行）
 _RUN_ENV_WHITELIST = (
     "PATH", "PATHEXT", "COMSPEC", "SystemRoot", "windir",
     "TEMP", "TMP", "TMPDIR", "HOME",
@@ -535,7 +474,7 @@ def _build_write_file(roots_provider: RootsProvider) -> ToolSpec:
         target.write_bytes(data)
         try:
             rel = target.relative_to(root).as_posix()
-        except ValueError:  # pragma: no cover - resolve 后必在 root 内
+        except ValueError:
             rel = Path(raw_path).as_posix()
         return {
             "path": rel,
@@ -596,14 +535,14 @@ def _build_delete_file(roots_provider: RootsProvider) -> ToolSpec:
                     "use run_command for recursive deletion",
                 )
             target.rmdir()
-        else:  # pragma: no cover - 特殊文件（socket 等）
+        else:
             raise ToolPermanentError(
                 f"Not a regular file or directory: {raw_path}",
                 code="not_a_file",
             )
         try:
             rel = target.relative_to(root).as_posix()
-        except ValueError:  # pragma: no cover
+        except ValueError:
             rel = Path(raw_path).as_posix()
         return {"path": rel, "deleted": True, "message": f"Deleted {rel}"}
 
@@ -627,13 +566,7 @@ def _build_delete_file(roots_provider: RootsProvider) -> ToolSpec:
     )
 
 
-# ----------------------------------------------------------------------
-# run_command（bash/命令执行，access=execute）
-# ----------------------------------------------------------------------
-
-
 def _resolve_shell_command() -> list[str]:
-    """跨平台 shell 前缀：优先 bash（Git Bash / WSL），Windows 回落 cmd。"""
     bash = shutil.which("bash")
     if bash:
         return [bash, "-c"]
@@ -656,7 +589,7 @@ def _build_run_command(roots_provider: RootsProvider) -> ToolSpec:
             raise ToolInputError("'timeout_s' must be a positive number")
         try:
             effective = min(float(timeout_s), float(get_settings().run_python_max_timeout_s))
-        except Exception:  # pragma: no cover - settings 不可用时用入参
+        except Exception:
             effective = float(timeout_s)
         effective = max(1.0, effective)
 
@@ -699,11 +632,11 @@ def _build_run_command(roots_provider: RootsProvider) -> ToolSpec:
         except asyncio.TimeoutError:
             try:
                 proc.kill()
-            except ProcessLookupError:  # pragma: no cover - 已自行退出
+            except ProcessLookupError:
                 pass
             try:
                 await asyncio.wait_for(proc.communicate(), timeout=_RUN_CMD_GRACE_S)
-            except Exception:  # pragma: no cover - 管道回收失败不掩盖超时
+            except Exception:
                 pass
             raise ToolPermanentError(
                 f"run_command timed out after {effective:g}s; subprocess force-killed",
@@ -738,15 +671,11 @@ def _build_run_command(roots_provider: RootsProvider) -> ToolSpec:
             "required": ["command"],
         },
         handler=handler,
-        # dispatcher 的强杀要晚于沙箱自身的超时钳制（max + 余量）
         timeout_s=float(get_settings().run_python_max_timeout_s) + 30.0,
-        parallel_safe=True,  # 独立子进程，互不干扰
+        parallel_safe=True,
         dangerous=True,
         access="execute",
     )
-
-
-# ----------------------------------------------------------------------
 
 
 def register_default_tools(
@@ -754,13 +683,6 @@ def register_default_tools(
     workspace_root: str | Path | RootsProvider,
     workspace_service: WorkspaceRegistry | None = None,
 ) -> list[ToolSpec]:
-    """注册默认安全工具；返回按名排序的注册结果。
-
-    workspace_root：目录集合来源——str/Path（兼容旧单目录注册）或
-    roots_provider 回调（provider 模式，执行时实时查询）。
-    workspace_service：WorkspaceRegistry 实例；提供时额外注册工作区管理
-    三工具（list / add / remove），agent 自主增删即刻生效。
-    """
     roots_provider = _coerce_roots_provider(workspace_root)
     specs = [
         _build_read_file(roots_provider),

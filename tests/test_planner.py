@@ -1,11 +1,3 @@
-"""任务拆解规划器测试—— 全部 mock LLM，绝不发起真实 API 调用。
-
-覆盖三层：
-- parse_plan：JSON 解析防御链（fence 剥离 / 大括号截取 / 字段校验 / 降级）
-- TaskPlanner.analyze：client 异常 / 空文本 → 降级 simple，永不抛异常
-- AgentLoop 集成：simple 不打扰；medium 发 task_options → 用户选择注入
-  注记；等待器返回 None（超时语义）→ 自动采用推荐方案
-"""
 
 from __future__ import annotations
 
@@ -28,11 +20,6 @@ from app.schemas.events import SSEEventType
 from app.tools.registry import ToolRegistry
 
 
-# ----------------------------------------------------------------------
-# 夹具（与 test_agent_loop 同模式：内存库 + 最小 registry）
-# ----------------------------------------------------------------------
-
-
 @pytest.fixture
 async def db_session() -> AsyncSession:
     engine = build_engine("sqlite+aiosqlite:///:memory:")
@@ -51,15 +38,14 @@ async def repo(db_session: AsyncSession) -> Repository:
 
 @pytest.fixture
 def registry() -> ToolRegistry:
-    return ToolRegistry()  # 规划器测试不执行工具，空 registry 即可
+    return ToolRegistry()
 
 
 class ScriptedLLM:
-    """按序回放 LLMTurnResult（与 test_agent_loop 同名同语义）。"""
 
     def __init__(self, turns: list[Any], delay_s: float = 0.0) -> None:
         self.turns = list(turns)
-        self.delay_s = delay_s  # 每次 run_turn 前模拟耗时（进度 ticker 测试用）
+        self.delay_s = delay_s
         self.calls: list[dict[str, Any]] = []
 
     async def run_turn(self, *, messages, **kwargs) -> LLMTurnResult:
@@ -81,7 +67,6 @@ def end_turn(text: str = "done") -> LLMTurnResult:
 
 
 class FakePlanner:
-    """脚本化规划器：analyze 按序回放 PlanResult，并记录调用入参。"""
 
     def __init__(self, results: list[PlanResult]) -> None:
         self.results = list(results)
@@ -129,11 +114,6 @@ PLAN_MEDIUM = PlanResult(
 )
 
 
-# ----------------------------------------------------------------------
-# parse_plan：解析防御链
-# ----------------------------------------------------------------------
-
-
 def test_parse_plan_valid_json() -> None:
     raw = json.dumps(
         {
@@ -169,10 +149,10 @@ def test_parse_plan_strips_code_fence_and_noise() -> None:
     [
         "",
         "不是 JSON",
-        '{"complexity": "hard", "options": []}',  # 复杂度白名单外
-        '{"options": [{"label": "a"}, {"label": "b"}]}',  # 缺 complexity
-        '{"complexity": "medium", "options": "no"}',  # options 非列表
-        '{"complexity": "medium", "options": [{"detail": "没 label"}]}',  # 全部无效选项
+        '{"complexity": "hard", "options": []}',
+        '{"options": [{"label": "a"}, {"label": "b"}]}',
+        '{"complexity": "medium", "options": "no"}',
+        '{"complexity": "medium", "options": [{"detail": "没 label"}]}',
     ],
 )
 def test_parse_plan_degrades_to_simple(raw: str) -> None:
@@ -182,7 +162,6 @@ def test_parse_plan_degrades_to_simple(raw: str) -> None:
 
 
 def test_parse_plan_medium_claim_with_one_option_degrades() -> None:
-    # 声称 medium 但有效选项不足 2 → 降级（残缺选项比打扰更糟）
     raw = '{"complexity": "medium", "options": [{"label": "唯一"}], "recommended": 0}'
     plan = parse_plan(raw)
     assert not plan.needs_choice
@@ -201,11 +180,10 @@ def test_parse_plan_long_running_flag() -> None:
     plan = parse_plan(raw)
     assert plan.long_running
     assert plan.progress_label == "批量转换文件"
-    assert not plan.needs_choice  # 简单但长时：直接跑，进度卡兜底
+    assert not plan.needs_choice
 
 
 def test_parse_plan_degraded_not_long_running() -> None:
-    # 一切降级路径（坏 JSON / 白名单外复杂度）long_running 必须为 False
     for raw in ("垃圾", '{"complexity": "hard"}', '{"complexity": "simple"}'):
         assert not parse_plan(raw).long_running
 
@@ -216,19 +194,13 @@ def test_parse_plan_max_options_cap() -> None:
     assert len(parse_plan(raw, max_options=4).options) == 4
 
 
-# ----------------------------------------------------------------------
-# TaskPlanner.analyze：降级保证（永不抛异常）
-# ----------------------------------------------------------------------
-
-
 class FakePlannerClient:
-    """client.messages.create 的脚本化替身（返回 text 块或抛异常）。"""
 
     def __init__(self, texts: list[str | None] | None = None, exc: Exception | None = None) -> None:
         self.texts = list(texts or [])
         self.exc = exc
         self.calls: list[dict[str, Any]] = []
-        self.messages = self  # TaskPlanner 经 client.messages.create 调用
+        self.messages = self
 
     async def create(self, **kwargs: Any):
         self.calls.append(kwargs)
@@ -259,7 +231,6 @@ async def test_planner_analyze_parses_json() -> None:
     plan = await planner.analyze("写个爬虫", [])
     assert plan.needs_choice
     assert plan.options[0].label == "A"
-    # 规划请求走 create（非流式），system 为规划器指令
     assert client.calls and "规划器" in client.calls[0]["system"]
 
 
@@ -286,22 +257,16 @@ async def test_planner_history_tail_included() -> None:
     assert "之前聊过的内容" in sent
 
 
-# ----------------------------------------------------------------------
-# AgentLoop 集成：选择门全链路
-# ----------------------------------------------------------------------
-
-
 @pytest.mark.asyncio
 async def test_simple_task_no_task_options(repo: Repository, registry: ToolRegistry) -> None:
     session = await repo.create_session(model="m", effort="high")
     llm = ScriptedLLM([end_turn()])
-    planner = FakePlanner([PlanResult()])  # simple → 不打扰
+    planner = FakePlanner([PlanResult()])
     events: list[Any] = []
     loop = build_loop(repo, registry, llm, planner=planner, event_sink=events.append)
     outcome = await loop.run(session.id, "你好")
     assert outcome.ok
     assert all(e.type != SSEEventType.TASK_OPTIONS for e in events)
-    # 规划器拿到的 history 不含刚追加的当前消息
     assert planner.calls[0][0] == "你好"
 
 
@@ -316,14 +281,13 @@ async def test_medium_task_user_choice_injected(
     captured: dict[str, int] = {}
 
     async def waiter(choice_id: str) -> int | None:
-        captured["choice_id"] = -1  # 占位；真实 id 由事件侧校验
-        return 1  # 用户选择方案 2
+        captured["choice_id"] = -1
+        return 1
 
     loop = build_loop(repo, registry, llm, planner=planner, choice_waiter=waiter, event_sink=events.append)
     outcome = await loop.run(session.id, "做个数据看板")
     assert outcome.ok
 
-    # ① task_options 事件载荷正确
     task_events = [e for e in events if e.type == SSEEventType.TASK_OPTIONS]
     assert len(task_events) == 1
     payload = task_events[0].data
@@ -332,7 +296,6 @@ async def test_medium_task_user_choice_injected(
     assert payload["options"][1]["label"] == "完整项目"
     assert payload["choice_id"].startswith("choice_")
 
-    # ② 选择注记以 user 消息落库 + 实时流带 role=user
     note_events = [
         e for e in events if e.type == SSEEventType.TEXT_DELTA and e.data.get("role") == "user"
     ]
@@ -341,7 +304,6 @@ async def test_medium_task_user_choice_injected(
     messages = await repo.get_messages(session.id)
     assert any("【任务拆解】" in str(m.content) for m in messages if m.role == "user")
 
-    # ③ 主 LLM 看到的 history 含选择注记（模型按选定方向执行）
     llm_messages = llm.calls[0]["messages"]
     assert any("完整项目" in str(b.get("text", "")) for m in llm_messages for b in m["content"])
 
@@ -352,11 +314,11 @@ async def test_choice_timeout_auto_adopts_recommended(
 ) -> None:
     session = await repo.create_session(model="m", effort="high")
     llm = ScriptedLLM([end_turn()])
-    planner = FakePlanner([PLAN_MEDIUM])  # recommended=1
+    planner = FakePlanner([PLAN_MEDIUM])
     events: list[Any] = []
 
     async def waiter(choice_id: str) -> int | None:
-        return None  # 超时语义（SessionManager.wait_choice 超时时返回 None）
+        return None
 
     loop = build_loop(repo, registry, llm, planner=planner, choice_waiter=waiter, event_sink=events.append)
     outcome = await loop.run(session.id, "做个数据看板")
@@ -365,14 +327,13 @@ async def test_choice_timeout_auto_adopts_recommended(
         e for e in events if e.type == SSEEventType.TEXT_DELTA and e.data.get("role") == "user"
     ]
     assert note_events and "自动采用推荐" in note_events[0].data["text"]
-    assert "完整项目" in note_events[0].data["text"]  # 采用的是 recommended=1
+    assert "完整项目" in note_events[0].data["text"]
 
 
 @pytest.mark.asyncio
 async def test_choice_resolved_async_after_emit(
     repo: Repository, registry: ToolRegistry
 ) -> None:
-    """选择门真实时序：task_options 发出后 waiter 挂起，事件侧稍后 resolve。"""
     session = await repo.create_session(model="m", effort="high")
     llm = ScriptedLLM([end_turn()])
     planner = FakePlanner([PLAN_MEDIUM])
@@ -382,13 +343,12 @@ async def test_choice_resolved_async_after_emit(
     async def waiter(choice_id: str) -> int | None:
         fut = asyncio.get_running_loop().create_future()
         futures[choice_id] = fut
-        return await fut  # 挂起直到测试侧 set_result
+        return await fut
 
     async def resolve_when_emitted() -> None:
         while not futures:
             await asyncio.sleep(0)
         choice_id = next(iter(futures))
-        # 模拟 POST /choices：选方案 0
         task_events = [e for e in events if e.type == SSEEventType.TASK_OPTIONS]
         assert task_events and task_events[0].data["choice_id"] == choice_id
         futures[choice_id].set_result(0)
@@ -406,7 +366,6 @@ async def test_choice_resolved_async_after_emit(
 
 @pytest.mark.asyncio
 async def test_planner_none_skips_gate(repo: Repository, registry: ToolRegistry) -> None:
-    """planner=None（禁用/降级开关）→ 行为与改造前完全一致。"""
     session = await repo.create_session(model="m", effort="high")
     llm = ScriptedLLM([end_turn()])
     events: list[Any] = []
@@ -414,11 +373,6 @@ async def test_planner_none_skips_gate(repo: Repository, registry: ToolRegistry)
     outcome = await loop.run(session.id, "hello")
     assert outcome.ok
     assert all(e.type != SSEEventType.TASK_OPTIONS for e in events)
-
-
-# ----------------------------------------------------------------------
-# 长时任务进度推送：扫描定义 + 分钟级 ticker
-# ----------------------------------------------------------------------
 
 
 def progress_events(events: list[Any]) -> list[Any]:
@@ -429,9 +383,8 @@ def progress_events(events: list[Any]) -> list[Any]:
 async def test_progress_emitted_when_planner_marks_long_running(
     repo: Repository, registry: ToolRegistry
 ) -> None:
-    """规划器标记 long_running → 按间隔推送 task_progress。"""
     session = await repo.create_session(model="m", effort="high")
-    llm = ScriptedLLM([end_turn()], delay_s=1.5)  # 单轮耗时 1.5s，跨过 1s 间隔
+    llm = ScriptedLLM([end_turn()], delay_s=1.5)
     planner = FakePlanner(
         [PlanResult(long_running=True, progress_label="批量转换")]
     )
@@ -455,7 +408,6 @@ async def test_progress_emitted_when_planner_marks_long_running(
 async def test_progress_runtime_upgrade_without_planner(
     repo: Repository, registry: ToolRegistry
 ) -> None:
-    """规划器未标记（或降级）→ 运行超 long_running_after_s 自动升级为长时。"""
     session = await repo.create_session(model="m", effort="high")
     llm = ScriptedLLM([end_turn()], delay_s=0.8)
     events: list[Any] = []
@@ -466,14 +418,13 @@ async def test_progress_runtime_upgrade_without_planner(
     outcome = await loop.run(session.id, "慢慢跑")
     assert outcome.ok
     ticks = progress_events(events)
-    assert len(ticks) >= 1  # 0.3s 升级 → 0.3/0.7(1.1) 推送，run 总长 ~0.8s+
+    assert len(ticks) >= 1
 
 
 @pytest.mark.asyncio
 async def test_no_progress_for_short_task(
     repo: Repository, registry: ToolRegistry
 ) -> None:
-    """短任务（run 先于升级阈值结束）→ 零 task_progress 事件。"""
     session = await repo.create_session(model="m", effort="high")
     llm = ScriptedLLM([end_turn()])
     events: list[Any] = []

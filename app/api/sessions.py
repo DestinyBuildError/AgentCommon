@@ -1,4 +1,3 @@
-"""会话 CRUD + 打断路由（契约）。薄协议转换，不含 Agent 逻辑。"""
 
 from __future__ import annotations
 
@@ -19,7 +18,6 @@ router = APIRouter(tags=["sessions"])
 async def create_session(
     body: SessionCreate, db: AsyncSession = Depends(get_db)
 ) -> SessionOut:
-    """创建会话。model / effort 缺省回落到全局 Settings。"""
     settings = get_settings()
     repo = Repository(db)
     session = await repo.create_session(
@@ -37,7 +35,6 @@ async def list_sessions(
     offset: int = 0,
     db: AsyncSession = Depends(get_db),
 ) -> list[SessionOut]:
-    """会话列表（H5 抽屉）：最近活跃在前。"""
     repo = Repository(db)
     sessions = await repo.list_sessions(limit=min(max(limit, 1), 500), offset=max(offset, 0))
     return list(sessions)
@@ -47,7 +44,6 @@ async def list_sessions(
 async def get_session(
     session_id: str, db: AsyncSession = Depends(get_db)
 ) -> SessionOut:
-    """会话详情 + 累计用量。"""
     session = await Repository(db).get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
@@ -60,7 +56,6 @@ async def delete_session(
     db: AsyncSession = Depends(get_db),
     manager: SessionManager = Depends(get_session_manager),
 ) -> None:
-    """删除会话：先停运行任务与事件订阅者，再级联删除消息/审计。"""
     repo = Repository(db)
     session = await repo.get_session(session_id)
     if session is None:
@@ -76,7 +71,6 @@ async def interrupt_session(
     db: AsyncSession = Depends(get_db),
     manager: SessionManager = Depends(get_session_manager),
 ) -> dict:
-    """打断当前轮。无运行中的 run 时 interrupted=false 仍返回 200。"""
     session = await Repository(db).get_session(session_id)
     if session is None:
         raise HTTPException(status_code=404, detail=f"session not found: {session_id}")
